@@ -1,0 +1,12 @@
+{
+  "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
+  "version": 1,
+  "name": "Open Channels",
+  "icon": "icon.svg",
+  "description": "One inbox for every channel your agent handles — WhatsApp, Telegram, Slack and email conversations mirrored into a single reviewable timeline, with agent-mediated replies and a per-thread audit trail of what the agent did.",
+  "app": {
+    "framework": "react+hono",
+    "database": true,
+    "storage": false
+  }
+}

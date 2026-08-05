@@ -1,0 +1,45 @@
+{
+  "name": "open-channels",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "clawnify dev",
+    "build": "vite build",
+    "deploy": "clawnify deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@clawnify/app": "^0.1.1",
+    "@clawnify/db": "^0.4.1",
+    "@clawnify/logokit": "^0.3.0",
+    "@hono/zod-openapi": "^0.19.0",
+    "hono": "^4.0.0",
+    "lucide-react": "^1.28.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "clawnify": "^0.11.3",
+    "drizzle-kit": "^0.31.0",
+    "drizzle-orm": "^0.45.2",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^6.0.0",
+    "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
+  }
+}
