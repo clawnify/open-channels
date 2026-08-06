@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FileText, RefreshCw, Search, X } from "lucide-react";
-import type { Conversation, Template } from "./api";
-import { listTemplates, refreshTemplates, sendTemplate, startConversation } from "./api";
+import type { Conversation, Profile, ProfileSource, Template } from "./api";
+import {
+  getProfileSource,
+  listTemplates,
+  refreshTemplates,
+  searchProfiles,
+  sendTemplate,
+  startConversation,
+} from "./api";
 import { CHANNELS, ChannelMark, Eyebrow, channelMeta } from "./ui";
 
 /** Substitutes filled values into a template body for the live preview. */
@@ -343,6 +350,71 @@ export function NewConversationDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The org's people app, when one is configured. Absent is the normal case
+  // for a fresh install, and everything below degrades to typing a handle.
+  const [source, setSource] = useState<ProfileSource | null>(null);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Profile[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [picked, setPicked] = useState<Profile | null>(null);
+
+  useEffect(() => {
+    getProfileSource()
+      .then((r) => setSource(r.source))
+      .catch(() => setSource(null));
+  }, []);
+
+  /** Which of a person's fields is the address on this channel. */
+  const addressFor = useCallback(
+    (p: Profile) => (channel === "email" ? p.email : p.phone ?? p.email),
+    [channel],
+  );
+
+  useEffect(() => {
+    if (!source || picked) return;
+    const q = query.trim();
+    if (!q) {
+      setResults([]);
+      return;
+    }
+    // Debounced: this is a proxied call into another app, not a local filter.
+    let live = true;
+    setSearching(true);
+    const t = setTimeout(() => {
+      searchProfiles(q)
+        .then((r) => live && setResults(r.items))
+        .catch(() => live && setResults([]))
+        .finally(() => live && setSearching(false));
+    }, 220);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [query, source, picked]);
+
+  function pick(p: Profile) {
+    setPicked(p);
+    setHandle(addressFor(p) ?? "");
+    // Their real name from the CRM is a curated name, not a provider guess —
+    // it belongs in `name`. Only fills a blank field; never overwrites typing.
+    setName((current) => current || p.name || "");
+    setQuery("");
+    setResults([]);
+  }
+
+  /**
+   * Editing the address by hand un-picks, so a link can never end up attached
+   * to someone else's number — but only when there was a known address to
+   * diverge *from*. Plenty of records have no phone on file; typing one for
+   * them is supplying the missing address, not retargeting the conversation,
+   * and dropping the link there would silently discard the pick.
+   */
+  function editHandle(value: string) {
+    setHandle(value);
+    const known = picked ? addressFor(picked) : null;
+    if (picked && known && value !== known) setPicked(null);
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!handle.trim() || busy) return;
@@ -354,6 +426,8 @@ export function NewConversationDialog({
         handle: handle.trim(),
         name: name.trim() || undefined,
         subject: channel === "email" && subject.trim() ? subject.trim() : undefined,
+        linked:
+          picked?.ref && source ? { appId: source.appId, ref: picked.ref } : undefined,
       });
       onOpened(conversation);
     } catch (err) {
@@ -401,6 +475,79 @@ export function NewConversationDialog({
 
           <div className="space-y-2.5">
             <Eyebrow>Contact</Eyebrow>
+
+            {source ? (
+              picked ? (
+                <div className="flex items-center gap-2 rounded-sm border border-border bg-sunken px-2.5 py-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[0.8125rem] font-medium text-foreground">
+                      {picked.name || picked.ref}
+                    </p>
+                    <p className="truncate text-[0.6875rem] text-muted">
+                      {addressFor(picked) || "no address on file"} ·{" "}
+                      {source.label ?? "people app"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPicked(null)}
+                    aria-label="Unlink this person"
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-muted transition-colors duration-150 hover:bg-surface hover:text-foreground"
+                  >
+                    <X className="size-3.5" aria-hidden />
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <label
+                    htmlFor="nc-person"
+                    className="block text-xs font-semibold tracking-[0.04em] text-muted"
+                  >
+                    Find someone in {source.label ?? "your records"}
+                  </label>
+                  <div className="relative">
+                    <Search
+                      className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-faint"
+                      aria-hidden
+                    />
+                    <input
+                      id="nc-person"
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      autoFocus
+                      placeholder="Search by name, phone or email"
+                      className="h-9 w-full rounded-sm border border-border bg-surface pl-8 pr-2.5 text-[0.8125rem] text-foreground outline-none transition-colors duration-150 focus:border-ring placeholder:text-faint"
+                    />
+                  </div>
+                  {query.trim() && !searching && results.length === 0 ? (
+                    <p className="text-[0.6875rem] leading-relaxed text-faint">
+                      Nobody found — type the {handleLabel.toLowerCase()} below instead.
+                    </p>
+                  ) : null}
+                  {results.length ? (
+                    <ul className="max-h-44 overflow-y-auto rounded-sm border border-border bg-surface">
+                      {results.map((p) => (
+                        <li key={p.ref}>
+                          <button
+                            type="button"
+                            onClick={() => pick(p)}
+                            className="flex w-full flex-col items-start gap-0.5 border-b border-border px-2.5 py-1.5 text-left transition-colors duration-150 last:border-b-0 hover:bg-sunken"
+                          >
+                            <span className="text-[0.8125rem] font-medium text-foreground">
+                              {p.name || p.ref}
+                            </span>
+                            <span className="text-[0.6875rem] text-muted">
+                              {addressFor(p) || "no address on file"}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              )
+            ) : null}
+
             <div className="space-y-1">
               <label htmlFor="nc-handle" className="block text-xs font-semibold tracking-[0.04em] text-muted">
                 {handleLabel}
@@ -408,9 +555,9 @@ export function NewConversationDialog({
               <input
                 id="nc-handle"
                 value={handle}
-                onChange={(e) => setHandle(e.target.value)}
+                onChange={(e) => editHandle(e.target.value)}
                 required
-                autoFocus
+                autoFocus={!source}
                 inputMode={channel === "whatsapp" || channel === "sms" ? "tel" : "text"}
                 placeholder={channel === "email" ? "person@company.com" : "+31612345678"}
                 className="h-9 w-full rounded-sm border border-border bg-surface px-2.5 text-[0.8125rem] text-foreground outline-none transition-colors duration-150 focus:border-ring placeholder:text-faint"

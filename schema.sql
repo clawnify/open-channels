@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS `contacts` (
 	`name` text,
 	`profile_name` text,
 	`avatar_url` text,
+	`linked_app_id` text,
+	`linked_ref` text,
 	`created_at` text NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS `contacts_by_org_channel_handle` ON `contacts` (`org_id`,`channel`,`handle`);
