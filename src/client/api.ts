@@ -4,8 +4,30 @@ export interface Contact {
   id: string;
   channel: string;
   handle: string;
+  /** Curated label, set by a human. Null unless someone chose one. */
   name: string | null;
+  /** The contact's own channel profile name, refreshed from inbound. */
+  profileName: string | null;
   avatarUrl: string | null;
+}
+
+/**
+ * What to call a contact: the curated name if someone set one, else the
+ * channel's profile name, else the raw handle. One helper so every surface
+ * agrees — a name a human typed must never be shadowed by provider data.
+ */
+export const contactLabel = (c: Contact): string =>
+  c.name?.trim() || c.profileName?.trim() || c.handle;
+
+/**
+ * What a thread accepts right now. On WhatsApp, freeform is only allowed for
+ * 24 hours after the contact's last message; outside that (and for a contact
+ * who has never written) the only way through is an approved template.
+ */
+export interface SendWindow {
+  freeformAllowed: boolean;
+  expiresAt: string | null;
+  lastInboundAt: string | null;
 }
 
 export interface Conversation {
@@ -17,6 +39,7 @@ export interface Conversation {
   lastMessageAt: string;
   lastMessagePreview: string;
   contact: Contact;
+  window: SendWindow;
 }
 
 export interface Message {
@@ -28,6 +51,20 @@ export interface Message {
   status: string | null; // queued | sent | failed (outbound only)
   error: string | null;
   createdAt: string;
+  templateName: string | null;
+}
+
+export interface Template {
+  id: string;
+  channel: string;
+  name: string;
+  language: string;
+  category: string;
+  status: string;
+  bodyText: string;
+  /** Placeholder tokens in bodyText, in order: ["1","2"] or ["first_name"]. */
+  variables: string[];
+  syncedAt: string;
 }
 
 export interface Stats {
@@ -37,12 +74,33 @@ export interface Stats {
   channels: { channel: string; open: number }[];
 }
 
+/** Carries the server's own message so the composer can show it verbatim. */
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers: init?.body ? { "Content-Type": "application/json", ...init?.headers } : init?.headers,
   });
-  if (!res.ok) throw new Error(`${init?.method ?? "GET"} ${path} → ${res.status}`);
+  if (!res.ok) {
+    // A 409 (window shut) or 422 (bad template) carries a sentence worth
+    // showing the user — don't flatten it to a status code.
+    let message = `${init?.method ?? "GET"} ${path} → ${res.status}`;
+    try {
+      const parsed = (await res.json()) as { error?: string };
+      if (parsed?.error) message = parsed.error;
+    } catch {
+      /* non-JSON error body — keep the status line */
+    }
+    throw new ApiError(res.status, message);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -68,11 +126,76 @@ export const getMessages = (
 ): Promise<{ items: Message[]; hasMore: boolean }> =>
   request(`/api/conversations/${conversationId}/messages?limit=${limit}`);
 
-export const sendReply = (conversationId: string, body: string): Promise<Message> =>
+/** Freeform text — rejected with 409 when the send window is shut. */
+export const sendReply = (
+  conversationId: string,
+  body: string,
+  fromPhoneNumberId?: string,
+): Promise<Message> =>
   request(`/api/conversations/${conversationId}/reply`, {
     method: "POST",
-    body: JSON.stringify({ body }),
+    body: JSON.stringify({ body, fromPhoneNumberId }),
   });
+
+/** An approved template — always accepted, and the only way to re-open a thread. */
+export const sendTemplate = (
+  conversationId: string,
+  template: { name: string; language: string; variables: Record<string, string> },
+  fromPhoneNumberId?: string,
+): Promise<Message> =>
+  request(`/api/conversations/${conversationId}/reply`, {
+    method: "POST",
+    body: JSON.stringify({ template, fromPhoneNumberId }),
+  });
+
+export const startConversation = (input: {
+  channel: string;
+  handle: string;
+  name?: string;
+  subject?: string;
+}): Promise<Conversation> =>
+  request("/api/conversations", { method: "POST", body: JSON.stringify(input) });
+
+export interface Phone {
+  id: string;
+  displayPhoneNumber: string;
+  verifiedName: string;
+  codeVerificationStatus: string;
+  platformType: string;
+  qualityRating: string;
+  /** Ready to send — anything else and every queued message fails at Meta. */
+  registered: boolean;
+  /** Outbound WhatsApp leaves from this number unless overridden per send. */
+  isDefault: boolean;
+}
+
+export const setDefaultPhone = (id: string): Promise<{ ok: boolean }> =>
+  request(`/api/whatsapp/phones/${id}/default`, { method: "POST" });
+
+export const listPhones = (): Promise<{ items: Phone[] }> => request("/api/whatsapp/phones");
+
+/** PIN goes straight to Meta; it is never stored here or returned. */
+export const registerPhone = (id: string, pin: string): Promise<{ ok: boolean }> =>
+  request(`/api/whatsapp/phones/${id}/register`, {
+    method: "POST",
+    body: JSON.stringify({ pin }),
+  });
+
+/** Pull the catalogue from the provider now. The app does this itself. */
+export const refreshTemplates = (channel: string): Promise<{ channel: string; count: number }> =>
+  request("/api/templates/refresh", { method: "POST", body: JSON.stringify({ channel }) });
+
+export function listTemplates(params: {
+  channel?: string;
+  search?: string;
+  limit?: number;
+}): Promise<{ items: Template[]; total: number }> {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== "") q.set(k, String(v));
+  }
+  return request(`/api/templates?${q}`);
+}
 
 export const addComment = (conversationId: string, body: string): Promise<Message> =>
   request(`/api/conversations/${conversationId}/comment`, {

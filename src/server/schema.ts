@@ -23,7 +23,19 @@ export const contacts = sqliteTable(
     channel: text("channel").notNull(),
     /** Channel-native address: phone number, email address, @username, member id. */
     handle: text("handle").notNull(),
+    /**
+     * The curated label — what WE call this person. Human-set, and never
+     * touched by ingest: a name someone typed must survive every inbound
+     * message, and a deliberate blank must stay blank.
+     */
     name: text("name"),
+    /**
+     * What THEY call themselves — the channel's own profile name, refreshed
+     * from each inbound message. Kept separate from `name` because provider
+     * data would otherwise silently overwrite human intent, and an empty
+     * `name` would be indistinguishable from "not set yet".
+     */
+    profileName: text("profile_name"),
     avatarUrl: text("avatar_url"),
     createdAt: text("created_at").notNull().$default(() => new Date().toISOString()),
   },
@@ -57,6 +69,74 @@ export const conversations = sqliteTable(
 );
 
 /**
+ * Small per-org key/value settings.
+ *
+ * Currently one key — `whatsapp_default_phone_number_id`, the number outbound
+ * WhatsApp goes out from. Once a WABA has more than one registered number,
+ * "pick the first" is not a default, it's whichever order the provider
+ * happened to return; the sending identity a customer sees is too visible to
+ * leave to that.
+ */
+export const settings = sqliteTable(
+  "settings",
+  {
+    id: text("id").primaryKey().$default(() => crypto.randomUUID()),
+    orgId: text("org_id").notNull(),
+    key: text("key").notNull(),
+    value: text("value").notNull(),
+    updatedAt: text("updated_at").notNull().$default(() => new Date().toISOString()),
+  },
+  (t) => ({
+    byOrgKey: uniqueIndex("settings_by_org_key").on(t.orgId, t.key),
+  }),
+);
+
+/**
+ * Approved channel message templates, mirrored in by the agent.
+ *
+ * WhatsApp Business only lets you open a conversation (or re-engage one whose
+ * 24-hour customer service window has lapsed) with a template Meta has
+ * approved. The app never calls Meta — the agent syncs the catalogue in via
+ * POST /api/templates/sync, exactly as it mirrors messages, so switching
+ * provider (Cloud API, Composio, Bird) never touches this app.
+ */
+export const templates = sqliteTable(
+  "templates",
+  {
+    id: text("id").primaryKey().$default(() => crypto.randomUUID()),
+    orgId: text("org_id").notNull(),
+    /** Channel the template belongs to — whatsapp today; the gate is per-channel. */
+    channel: text("channel").notNull(),
+    /** Meta template name, e.g. "appointment_reminder_v1". */
+    name: text("name").notNull(),
+    /** Meta language code, e.g. "en_US". A name exists once per language. */
+    language: text("language").notNull(),
+    /** AUTHENTICATION | MARKETING | UTILITY */
+    category: text("category").notNull(),
+    /** APPROVED | PENDING | REJECTED | DISABLED | PAUSED | LIMIT_EXCEEDED */
+    status: text("status").notNull(),
+    /** BODY component text, placeholders intact — what the composer previews. */
+    bodyText: text("body_text").notNull().default(""),
+    /** Ordered placeholder tokens in bodyText: ["1","2"] or ["first_name"]. */
+    variables: text("variables").notNull().default("[]"),
+    /** Meta's full components array (HEADER/BODY/FOOTER/BUTTONS), verbatim JSON. */
+    components: text("components").notNull().default("[]"),
+    /** Meta's own template id, for provenance and dedupe across renames. */
+    externalId: text("external_id"),
+    syncedAt: text("synced_at").notNull().$default(() => new Date().toISOString()),
+  },
+  (t) => ({
+    byOrgChannelNameLang: uniqueIndex("templates_by_org_channel_name_language").on(
+      t.orgId,
+      t.channel,
+      t.name,
+      t.language,
+    ),
+    byOrgChannel: index("templates_by_org_channel").on(t.orgId, t.channel, t.status),
+  }),
+);
+
+/**
  * Everything that happens in a thread, in one timeline:
  *   kind=inbound   — a message from the contact
  *   kind=outbound  — a message to the contact (status: queued → sent | failed)
@@ -81,6 +161,16 @@ export const messages = sqliteTable(
     error: text("error"),
     /** Channel-native message id — makes ingest idempotent. */
     externalId: text("external_id"),
+    /**
+     * Template send (outbound only, null for freeform). The agent MUST send
+     * these through the template API with these exact values — `body` holds the
+     * rendered text for humans to read, and sending that as freeform would be
+     * rejected outside the 24-hour window.
+     */
+    templateName: text("template_name"),
+    templateLanguage: text("template_language"),
+    /** JSON object of placeholder token → value, e.g. {"1":"Kara"}. */
+    templateVariables: text("template_variables"),
     createdAt: text("created_at").notNull().$default(() => new Date().toISOString()),
   },
   (t) => ({

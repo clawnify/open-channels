@@ -1,5 +1,6 @@
 import { OpenAPIHono, createRoute, z, user, orgId, caller } from "@clawnify/app";
-import { getDB, and, or, eq, desc, asc, lt, like, count, sql } from "@clawnify/db";
+import { connect } from "@clawnify/connections";
+import { getDB, and, or, eq, desc, asc, lt, like, count, sql, inArray } from "@clawnify/db";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import * as schema from "./schema";
 
@@ -21,10 +22,21 @@ const ContactSchema = z
     id: z.string(),
     channel: z.string(),
     handle: z.string(),
+    /** Curated label, set by a human. Null unless someone chose one. */
     name: z.string().nullable(),
+    /** The contact's own channel profile name, refreshed from inbound. */
+    profileName: z.string().nullable(),
     avatarUrl: z.string().nullable(),
   })
   .openapi("Contact");
+
+const SendWindowSchema = z
+  .object({
+    freeformAllowed: z.boolean(),
+    expiresAt: z.string().nullable(),
+    lastInboundAt: z.string().nullable(),
+  })
+  .openapi("SendWindow");
 
 const ConversationSchema = z
   .object({
@@ -36,8 +48,24 @@ const ConversationSchema = z
     lastMessageAt: z.string(),
     lastMessagePreview: z.string(),
     contact: ContactSchema,
+    /** What this thread accepts right now — freeform, or template-only. */
+    window: SendWindowSchema,
   })
   .openapi("Conversation");
+
+const TemplateSchema = z
+  .object({
+    id: z.string(),
+    channel: z.string(),
+    name: z.string(),
+    language: z.string(),
+    category: z.string(),
+    status: z.string(),
+    bodyText: z.string(),
+    variables: z.array(z.string()),
+    syncedAt: z.string(),
+  })
+  .openapi("Template");
 
 const MessageSchema = z
   .object({
@@ -49,6 +77,8 @@ const MessageSchema = z
     status: z.string().nullable(),
     error: z.string().nullable(),
     createdAt: z.string(),
+    /** Set when this outbound message was sent as an approved template. */
+    templateName: z.string().nullable(),
   })
   .openapi("Message");
 
@@ -65,9 +95,282 @@ const jsonRes = <T extends z.ZodTypeAny>(s: T, description: string) => ({
 
 const preview = (body: string) => body.replace(/\s+/g, " ").trim().slice(0, 140);
 
+/* ------------------------- the re-engagement window ------------------------ */
+
+/**
+ * WhatsApp Business only accepts freeform messages inside a 24-hour customer
+ * service window that opens on each *inbound* message. Outside it — and on a
+ * contact who has never written — the only way through is a template Meta has
+ * approved. Everything below encodes that one rule.
+ *
+ * The window is measured from the last INBOUND message, not the last message:
+ * a thread we replied to an hour ago is still closed if the contact last wrote
+ * three days back.
+ */
+const WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** Channels that have a re-engagement window. Others take freeform any time. */
+const WINDOWED_CHANNELS = new Set(["whatsapp"]);
+
+type SendWindow = {
+  /** False when only an approved template may be sent. */
+  freeformAllowed: boolean;
+  /** ISO time the window shuts; null when the channel has none or it's shut. */
+  expiresAt: string | null;
+  lastInboundAt: string | null;
+};
+
+const OPEN_WINDOW: SendWindow = {
+  freeformAllowed: true,
+  expiresAt: null,
+  lastInboundAt: null,
+};
+
+const windowFrom = (lastInboundAt: string | null, now: number): SendWindow => {
+  if (!lastInboundAt) return { freeformAllowed: false, expiresAt: null, lastInboundAt: null };
+  const closesAt = new Date(lastInboundAt).getTime() + WINDOW_MS;
+  const open = closesAt > now;
+  return {
+    freeformAllowed: open,
+    expiresAt: open ? new Date(closesAt).toISOString() : null,
+    lastInboundAt,
+  };
+};
+
+/**
+ * Window state for a page of conversations in ONE aggregate query — the list
+ * renders it per row, so a per-row lookup would be an N+1 on every poll.
+ */
+async function windowsFor(
+  db: DB,
+  convs: (typeof schema.conversations.$inferSelect)[],
+  now = Date.now(),
+): Promise<Map<string, SendWindow>> {
+  const windowed = convs.filter((c) => WINDOWED_CHANNELS.has(c.channel));
+  const out = new Map<string, SendWindow>(
+    convs.filter((c) => !WINDOWED_CHANNELS.has(c.channel)).map((c) => [c.id, OPEN_WINDOW]),
+  );
+  if (windowed.length === 0) return out;
+
+  const lastInbound = await db
+    .select({
+      conversationId: schema.messages.conversationId,
+      at: sql<string>`max(${schema.messages.createdAt})`,
+    })
+    .from(schema.messages)
+    .where(
+      and(
+        eq(schema.messages.kind, "inbound"),
+        inArray(
+          schema.messages.conversationId,
+          windowed.map((c) => c.id),
+        ),
+      ),
+    )
+    .groupBy(schema.messages.conversationId);
+
+  const byConv = new Map(lastInbound.map((r) => [r.conversationId, r.at]));
+  for (const c of windowed) out.set(c.id, windowFrom(byConv.get(c.id) ?? null, now));
+  return out;
+}
+
+/** Window state for a single conversation. */
+async function sendWindow(
+  db: DB,
+  conv: typeof schema.conversations.$inferSelect,
+  now = Date.now(),
+): Promise<SendWindow> {
+  return (await windowsFor(db, [conv], now)).get(conv.id) ?? OPEN_WINDOW;
+}
+
+/* --------------------------------- templates ------------------------------- */
+
+/** Placeholder tokens in a template body, in order: {{1}} / {{first_name}}. */
+const PLACEHOLDER = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+
+const placeholdersIn = (body: string): string[] => {
+  const seen = new Set<string>();
+  for (const m of body.matchAll(PLACEHOLDER)) seen.add(m[1]);
+  return [...seen];
+};
+
+/** Substitutes values into a template body for the human-readable timeline. */
+const renderTemplate = (body: string, values: Record<string, string>) =>
+  body.replace(PLACEHOLDER, (whole, token: string) => values[token] ?? whole);
+
+/** Pulls the BODY component's text out of Meta's components array. */
+function bodyTextOf(components: unknown): string {
+  if (!Array.isArray(components)) return "";
+  for (const c of components) {
+    if (c && typeof c === "object" && (c as { type?: string }).type?.toUpperCase() === "BODY") {
+      return String((c as { text?: string }).text ?? "");
+    }
+  }
+  return "";
+}
+
+/** One template as the provider describes it, before it becomes a row. */
+type ProviderTemplate = {
+  name: string;
+  language: string;
+  category?: string;
+  status?: string;
+  components?: unknown;
+  id?: string;
+};
+
+/**
+ * Where a channel's catalogue comes from. The app fetches this itself through
+ * the org's connected integration (`@clawnify/connections`) rather than waiting
+ * for an agent to mirror it in: the catalogue is reference data, needs no
+ * judgement, and a human clicking "Refresh" should get an answer now.
+ *
+ * Only channels with a real template concept appear here — everything else
+ * takes freeform and has nothing to list.
+ */
+/**
+ * Composio caps `limit` at 100, but a full page is slow enough that the broker
+ * hop times out (522). Smaller pages return inside the budget; pagination below
+ * still walks the whole catalogue, so this costs round trips, not coverage.
+ */
+const PROVIDER_PAGE = 25;
+/** Backstop so a paging bug can't spin forever: 25 × 40 = 1000 templates. */
+const MAX_PAGES = 40;
+
+const TEMPLATE_SOURCES: Record<string, (env: Env["Bindings"]) => Promise<ProviderTemplate[]>> = {
+  whatsapp: async (env) => {
+    // Ask for APPROVED only — the picker must never offer one that will bounce.
+    const client = connect("whatsapp", env as never);
+    const all: ProviderTemplate[] = [];
+    let after: string | undefined;
+
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const result = await client.run("WHATSAPP_GET_MESSAGE_TEMPLATES", {
+        status: "APPROVED",
+        limit: PROVIDER_PAGE,
+        ...(after ? { after } : {}),
+      });
+      const { items, nextCursor } = metaPage(result);
+      all.push(...items);
+      if (!nextCursor || items.length === 0) break;
+      after = nextCursor;
+    }
+    return all;
+  },
+};
+
+/**
+ * Pull one page out of Meta's `{ data: [...], paging: { cursors: { after } } }`,
+ * however deep the broker nests it under its own `data` envelope. Written
+ * defensively on purpose: the shape belongs to two vendors, and a silent change
+ * should yield an empty catalogue, never a crash.
+ */
+/**
+ * Descend through the broker's `data` envelopes to Meta's own
+ * `{ data: [...], paging }` node. Shared by every Meta reader here, and written
+ * defensively: the shape belongs to two vendors, so an unexpected one should
+ * yield nothing rather than throw.
+ */
+function unwrapMetaRows(result: unknown): {
+  rows: Record<string, unknown>[];
+  paging?: { cursors?: { after?: string }; next?: string };
+} {
+  const seen = new Set<unknown>();
+  let node: unknown = result;
+  let holder: Record<string, unknown> | undefined;
+  while (node && typeof node === "object" && !seen.has(node)) {
+    seen.add(node);
+    const obj = node as Record<string, unknown>;
+    if (Array.isArray(obj.data)) {
+      holder = obj;
+      break;
+    }
+    node = obj.data;
+  }
+  const raw = Array.isArray(holder?.data) ? holder.data : Array.isArray(result) ? result : [];
+  return {
+    rows: raw.filter((r): r is Record<string, unknown> => !!r && typeof r === "object"),
+    paging: holder?.paging as { cursors?: { after?: string }; next?: string } | undefined,
+  };
+}
+
+function metaPage(result: unknown): { items: ProviderTemplate[]; nextCursor?: string } {
+  const { rows, paging } = unwrapMetaRows(result);
+  // No `next` link means this is the last page, whatever the cursor says.
+  const nextCursor = paging?.next ? paging.cursors?.after : undefined;
+
+  const items = rows
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
+    .filter((t) => typeof t.name === "string" && typeof t.language === "string")
+    .map((t) => ({
+      name: t.name as string,
+      language: t.language as string,
+      category: typeof t.category === "string" ? t.category : undefined,
+      status: typeof t.status === "string" ? t.status : undefined,
+      components: t.components,
+      id: typeof t.id === "string" ? t.id : undefined,
+    }));
+
+  return { items, nextCursor };
+}
+
+/**
+ * Replace a channel's catalogue in one shot. A replace (not a merge) is what
+ * keeps a paused or deleted template from lingering in the composer after the
+ * provider has withdrawn it.
+ */
+async function replaceCatalogue(
+  db: DB,
+  org: string,
+  channel: string,
+  templates: ProviderTemplate[],
+): Promise<number> {
+  const now = new Date().toISOString();
+  await db
+    .delete(schema.templates)
+    .where(and(eq(schema.templates.orgId, org), eq(schema.templates.channel, channel)));
+
+  if (templates.length === 0) return 0;
+
+  const rows = templates.map((t) => {
+    const bodyText = bodyTextOf(t.components);
+    return {
+      orgId: org,
+      channel,
+      name: t.name,
+      language: t.language,
+      category: t.category ?? "UTILITY",
+      status: (t.status ?? "APPROVED").toUpperCase(),
+      bodyText,
+      variables: JSON.stringify(placeholdersIn(bodyText)),
+      components: JSON.stringify(t.components ?? []),
+      externalId: t.id ?? null,
+      syncedAt: now,
+    };
+  });
+
+  // Chunked: each row binds 12 parameters, and D1 caps bound parameters per
+  // statement — one INSERT of a whole catalogue blows that limit.
+  const ROWS_PER_INSERT = 5;
+  for (let i = 0; i < rows.length; i += ROWS_PER_INSERT) {
+    await db.insert(schema.templates).values(rows.slice(i, i + ROWS_PER_INSERT));
+  }
+  return rows.length;
+}
+
+const toContact = (contact: typeof schema.contacts.$inferSelect) => ({
+  id: contact.id,
+  channel: contact.channel,
+  handle: contact.handle,
+  name: contact.name,
+  profileName: contact.profileName,
+  avatarUrl: contact.avatarUrl,
+});
+
 const toConversation = (
   conv: typeof schema.conversations.$inferSelect,
   contact: typeof schema.contacts.$inferSelect,
+  window: SendWindow,
 ) => ({
   id: conv.id,
   channel: conv.channel,
@@ -76,13 +379,8 @@ const toConversation = (
   unread: conv.unread,
   lastMessageAt: conv.lastMessageAt,
   lastMessagePreview: conv.lastMessagePreview,
-  contact: {
-    id: contact.id,
-    channel: contact.channel,
-    handle: contact.handle,
-    name: contact.name,
-    avatarUrl: contact.avatarUrl,
-  },
+  contact: toContact(contact),
+  window,
 });
 
 const toMessage = (m: typeof schema.messages.$inferSelect) => ({
@@ -94,6 +392,19 @@ const toMessage = (m: typeof schema.messages.$inferSelect) => ({
   status: m.status,
   error: m.error,
   createdAt: m.createdAt,
+  templateName: m.templateName,
+});
+
+const toTemplate = (t: typeof schema.templates.$inferSelect) => ({
+  id: t.id,
+  channel: t.channel,
+  name: t.name,
+  language: t.language,
+  category: t.category,
+  status: t.status,
+  bodyText: t.bodyText,
+  variables: JSON.parse(t.variables) as string[],
+  syncedAt: t.syncedAt,
 });
 
 /** Loads a conversation scoped to the caller's org; null means 404 or no org. */
@@ -184,18 +495,20 @@ api.openapi(
           orgId: org,
           channel: input.channel,
           handle: input.contact.handle,
-          name: input.contact.name ?? null,
+          // Provider-supplied → profileName. `name` is the human's to set.
+          profileName: input.contact.name ?? null,
           avatarUrl: input.contact.avatarUrl ?? null,
         })
         .returning();
     } else if (
-      (input.contact.name && input.contact.name !== contact.name) ||
+      (input.contact.name && input.contact.name !== contact.profileName) ||
       (input.contact.avatarUrl && input.contact.avatarUrl !== contact.avatarUrl)
     ) {
       [contact] = await db
         .update(schema.contacts)
         .set({
-          name: input.contact.name ?? contact.name,
+          // Only the profile name — a curated `name` outlives every inbound.
+          profileName: input.contact.name ?? contact.profileName,
           avatarUrl: input.contact.avatarUrl ?? contact.avatarUrl,
         })
         .where(eq(schema.contacts.id, contact.id))
@@ -328,7 +641,110 @@ api.openapi(
         .where(where),
     ]);
 
-    return c.json({ items: rows.map((r) => toConversation(r.conv, r.contact)), total }, 200);
+    const windows = await windowsFor(
+      db,
+      rows.map((r) => r.conv),
+    );
+    return c.json(
+      {
+        items: rows.map((r) =>
+          toConversation(r.conv, r.contact, windows.get(r.conv.id) ?? OPEN_WINDOW),
+        ),
+        total,
+      },
+      200,
+    );
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "post",
+    path: "/api/conversations",
+    summary: "Start a conversation with a contact",
+    description:
+      "Opens (or returns) the thread for one contact on one channel so a human can write first. Idempotent: an existing thread for that (channel, handle) is returned as-is, never duplicated. Sending is a separate step — POST /api/conversations/:id/reply — and the returned `window` says whether that reply may be freeform or must be a template.",
+    request: {
+      body: jsonBody(
+        z
+          .object({
+            channel: z.enum(CHANNELS),
+            handle: z.string().min(1),
+            name: z.string().optional(),
+            subject: z.string().optional(),
+          })
+          .openapi("StartConversation"),
+      ),
+    },
+    responses: {
+      200: jsonRes(ConversationSchema, "The conversation (existing or new)"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const input = c.req.valid("json");
+    const db = dbFor(c.env);
+    const now = new Date().toISOString();
+
+    let [contact] = await db
+      .select()
+      .from(schema.contacts)
+      .where(
+        and(
+          eq(schema.contacts.orgId, org),
+          eq(schema.contacts.channel, input.channel),
+          eq(schema.contacts.handle, input.handle),
+        ),
+      )
+      .limit(1);
+    if (!contact) {
+      [contact] = await db
+        .insert(schema.contacts)
+        .values({
+          orgId: org,
+          channel: input.channel,
+          handle: input.handle,
+          name: input.name ?? null,
+        })
+        .returning();
+    } else if (input.name && input.name !== contact.name) {
+      [contact] = await db
+        .update(schema.contacts)
+        .set({ name: input.name })
+        .where(eq(schema.contacts.id, contact.id))
+        .returning();
+    }
+
+    let [conv] = await db
+      .select()
+      .from(schema.conversations)
+      .where(
+        and(eq(schema.conversations.orgId, org), eq(schema.conversations.contactId, contact.id)),
+      )
+      .limit(1);
+    if (!conv) {
+      [conv] = await db
+        .insert(schema.conversations)
+        .values({
+          orgId: org,
+          contactId: contact.id,
+          channel: input.channel,
+          subject: input.subject ?? null,
+          lastMessageAt: now,
+        })
+        .returning();
+    } else if (conv.status === "closed") {
+      // Writing to an archived thread reopens it, same as a new inbound would.
+      [conv] = await db
+        .update(schema.conversations)
+        .set({ status: "open" })
+        .where(eq(schema.conversations.id, conv.id))
+        .returning();
+    }
+
+    return c.json(toConversation(conv, contact, await sendWindow(db, conv)), 200);
   },
 );
 
@@ -413,7 +829,7 @@ api.openapi(
       .from(schema.contacts)
       .where(eq(schema.contacts.id, conv.contactId))
       .limit(1);
-    return c.json(toConversation(conv, contact), 200);
+    return c.json(toConversation(conv, contact, await sendWindow(db, conv)), 200);
   },
 );
 
@@ -465,27 +881,152 @@ api.openapi(
 
 const ComposeSchema = z.object({ body: z.string().min(1) }).openapi("Compose");
 
+const ReplySchema = z
+  .object({
+    /** Freeform text. Only accepted while the send window is open. */
+    body: z.string().min(1).optional(),
+    /** An approved template. Always accepted — this is how a closed thread opens. */
+    template: z
+      .object({
+        name: z.string().min(1),
+        language: z.string().min(1),
+        /** Placeholder token → value, e.g. {"1": "Kara"}. */
+        variables: z.record(z.string()).default({}),
+      })
+      .optional(),
+    /** Send from this number instead of the org default (WhatsApp). */
+    fromPhoneNumberId: z.string().optional(),
+  })
+  .openapi("Reply");
+
 api.openapi(
   createRoute({
     method: "post",
     path: "/api/conversations/:id/reply",
     summary: "Queue a reply to the contact",
     description:
-      "Writes an outbound message with status=queued. The org's agent picks it up from GET /api/outbox, sends it through the conversation's channel, then confirms via POST /api/messages/:id/status. The app never sends directly.",
-    request: { params: IdParam, body: jsonBody(ComposeSchema) },
+      "Sends an outbound message. On channels the app can reach itself (WhatsApp) it goes out immediately and comes back status=sent or status=failed with the provider's reason. On other channels it is written status=queued for the agent to pick up from GET /api/outbox.\n\nSend EITHER `body` (freeform) OR `template`. Freeform is rejected with 409 when the conversation's 24-hour window is shut — on WhatsApp that is the provider's rule, not ours, so a 409 means send a template instead, not retry.",
+    request: { params: IdParam, body: jsonBody(ReplySchema) },
     responses: {
       201: jsonRes(MessageSchema, "The queued outbound message"),
+      400: jsonRes(ErrorSchema, "Send exactly one of body or template"),
       401: jsonRes(ErrorSchema, "No org identity"),
       404: jsonRes(ErrorSchema, "Not found"),
+      409: jsonRes(ErrorSchema, "Window shut — a template is required"),
+      422: jsonRes(ErrorSchema, "Template unknown, not approved, or missing variables"),
     },
   }),
   async (c) => {
     const conv = await findConversation(c, c.req.valid("param").id);
     if (!conv) return c.json({ error: "not found" }, orgId(c) ? 404 : 401);
-    const { body } = c.req.valid("json");
+    const input = c.req.valid("json");
+    if (!input.body === !input.template) {
+      return c.json({ error: "send exactly one of body or template" }, 400);
+    }
+
     const u = user(c);
     const db = dbFor(c.env);
     const now = new Date().toISOString();
+
+    let body: string;
+    let templateFields: {
+      templateName: string | null;
+      templateLanguage: string | null;
+      templateVariables: string | null;
+    } = { templateName: null, templateLanguage: null, templateVariables: null };
+
+    if (input.template) {
+      const [tpl] = await db
+        .select()
+        .from(schema.templates)
+        .where(
+          and(
+            eq(schema.templates.orgId, conv.orgId),
+            eq(schema.templates.channel, conv.channel),
+            eq(schema.templates.name, input.template.name),
+            eq(schema.templates.language, input.template.language),
+          ),
+        )
+        .limit(1);
+      if (!tpl) {
+        return c.json(
+          { error: `no template "${input.template.name}" (${input.template.language}) on ${conv.channel}` },
+          422,
+        );
+      }
+      if (tpl.status !== "APPROVED") {
+        return c.json({ error: `template "${tpl.name}" is ${tpl.status}, not APPROVED` }, 422);
+      }
+      const required = JSON.parse(tpl.variables) as string[];
+      const missing = required.filter((t) => !input.template!.variables[t]?.trim());
+      if (missing.length > 0) {
+        return c.json({ error: `template needs values for: ${missing.join(", ")}` }, 422);
+      }
+
+      body = renderTemplate(tpl.bodyText, input.template.variables);
+      templateFields = {
+        templateName: tpl.name,
+        templateLanguage: tpl.language,
+        templateVariables: JSON.stringify(input.template.variables),
+      };
+    } else {
+      // Freeform: only inside the window. The channel would reject it otherwise,
+      // so refusing here keeps the failure in the UI instead of the outbox.
+      const w = await sendWindow(db, conv);
+      if (!w.freeformAllowed) {
+        return c.json(
+          {
+            error:
+              w.lastInboundAt === null
+                ? "This contact has never written — open the thread with an approved template."
+                : "The 24-hour window has closed — re-engage with an approved template.",
+          },
+          409,
+        );
+      }
+      body = input.body!;
+    }
+
+    // Send now when the app can reach the channel; otherwise queue for the
+    // agent. `queued` should mean "waiting on the agent", never "waiting on a
+    // heartbeat to relay something we could have sent ourselves".
+    const sender = CHANNEL_SENDERS[conv.channel];
+    let status = "queued";
+    let error: string | null = null;
+    let externalId: string | null = null;
+
+    if (sender) {
+      const [contact] = await db
+        .select()
+        .from(schema.contacts)
+        .where(eq(schema.contacts.id, conv.contactId))
+        .limit(1);
+      try {
+        const sent = await sender(c.env, contact.handle, {
+          body,
+          template: input.template
+            ? {
+                name: templateFields.templateName!,
+                language: templateFields.templateLanguage!,
+                variables: input.template.variables,
+              }
+            : undefined,
+          fromPhoneNumberId:
+            input.fromPhoneNumberId ?? (await readSetting(db, conv.orgId, DEFAULT_PHONE_KEY)),
+        });
+        // Meta replies `accepted` — queued for delivery, NOT delivered. It can
+        // still be dropped (no opt-in, marketing caps, quality limits) and the
+        // only notice is a delivery receipt on the status webhook. Claiming
+        // "sent" here is how a silently-dropped message looks successful.
+        status = "accepted";
+        externalId = sent.externalId;
+      } catch (err) {
+        // Record the failure on the message rather than losing the draft —
+        // the thread shows why, and the text is still there to retry.
+        status = "failed";
+        error = `${err}`;
+      }
+    }
 
     const [msg] = await db
       .insert(schema.messages)
@@ -494,9 +1035,12 @@ api.openapi(
         conversationId: conv.id,
         kind: "outbound",
         body,
-        status: "queued",
+        status,
+        error,
+        externalId,
         authorName: u?.name ?? u?.email ?? "Agent",
         userId: u?.id ?? null,
+        ...templateFields,
         createdAt: now,
       })
       .returning();
@@ -613,6 +1157,400 @@ api.openapi(
   },
 );
 
+/* --------------------------------- templates ------------------------------- */
+
+api.openapi(
+  createRoute({
+    method: "post",
+    path: "/api/templates/refresh",
+    summary: "Pull the approved template catalogue from the provider",
+    description:
+      "Fetches the channel's templates through the org's own connected integration and replaces the stored catalogue. The app does this itself — no agent turn — so the picker is never stale because an agent was asleep. Safe to call from a button; it is a full replace, so a template the provider has withdrawn disappears here too.",
+    request: {
+      body: jsonBody(
+        z
+          .object({ channel: z.enum(CHANNELS).default("whatsapp") })
+          .openapi("TemplateRefresh"),
+      ),
+    },
+    responses: {
+      200: jsonRes(
+        z.object({ channel: z.string(), count: z.number() }).openapi("TemplateRefreshResult"),
+        "Catalogue refreshed",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      424: jsonRes(ErrorSchema, "The channel's integration isn't connected or returned an error"),
+      501: jsonRes(ErrorSchema, "Channel has no template catalogue"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const { channel } = c.req.valid("json");
+
+    const source = TEMPLATE_SOURCES[channel];
+    if (!source) {
+      return c.json({ error: `${channel} has no template catalogue to refresh` }, 501);
+    }
+
+    let templates: ProviderTemplate[];
+    try {
+      templates = await source(c.env);
+    } catch (err) {
+      // Surfaced verbatim in the composer — "not connected" and "token expired"
+      // need different fixes, so don't flatten them into one message.
+      return c.json({ error: `could not reach ${channel}: ${err}` }, 424);
+    }
+
+    try {
+      const count = await replaceCatalogue(dbFor(c.env), org, channel, templates);
+      return c.json({ channel, count }, 200);
+    } catch (err) {
+      // A bare 500 tells the operator nothing; say what broke while storing.
+      return c.json({ error: `fetched ${templates.length} templates but could not store them: ${err}` }, 424);
+    }
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "get",
+    path: "/api/templates",
+    summary: "List templates available to send",
+    description:
+      "Paginated catalogue for the composer's template picker. Defaults to APPROVED only — those are the only ones a channel will actually accept. Use ?search= to narrow by name or body text.",
+    request: {
+      query: z.object({
+        channel: z.enum(CHANNELS).optional(),
+        status: z.string().default("APPROVED"),
+        search: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(100).default(25),
+        offset: z.coerce.number().int().min(0).default(0),
+      }),
+    },
+    responses: {
+      200: jsonRes(
+        z.object({ items: z.array(TemplateSchema), total: z.number() }).openapi("TemplatePage"),
+        "One page of templates",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const q = c.req.valid("query");
+    const db = dbFor(c.env);
+
+    const filters = [eq(schema.templates.orgId, org)];
+    if (q.channel) filters.push(eq(schema.templates.channel, q.channel));
+    if (q.status !== "all") filters.push(eq(schema.templates.status, q.status));
+    if (q.search) {
+      const term = `%${q.search}%`;
+      filters.push(or(like(schema.templates.name, term), like(schema.templates.bodyText, term))!);
+    }
+    const where = and(...filters);
+
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select()
+        .from(schema.templates)
+        .where(where)
+        .orderBy(asc(schema.templates.name))
+        .limit(q.limit)
+        .offset(q.offset),
+      db.select({ total: count() }).from(schema.templates).where(where),
+    ]);
+
+    return c.json({ items: rows.map(toTemplate), total }, 200);
+  },
+);
+
+/* --------------------------------- sending -------------------------------- */
+
+/**
+ * Channels the app can send on itself.
+ *
+ * A human clicking Send should send — not wait for an agent heartbeat to relay
+ * text they already wrote. The agent keeps its own send path for messages IT
+ * originates (where allowlists and approval rules belong); a person acting in
+ * the dashboard is already authorised, so gating them behind an agent turn adds
+ * latency, an agent-liveness dependency, and an LLM turn spent copying a string.
+ *
+ * Channels absent here still queue to /api/outbox for the agent, unchanged.
+ */
+type SendResult = { externalId: string | null };
+
+/** Which number outbound WhatsApp leaves from. */
+const DEFAULT_PHONE_KEY = "whatsapp_default_phone_number_id";
+
+const readSetting = async (db: DB, org: string, key: string): Promise<string | null> => {
+  const [row] = await db
+    .select({ value: schema.settings.value })
+    .from(schema.settings)
+    .where(and(eq(schema.settings.orgId, org), eq(schema.settings.key, key)))
+    .limit(1);
+  return row?.value ?? null;
+};
+
+const CHANNEL_SENDERS: Record<
+  string,
+  (
+    env: Env["Bindings"],
+    to: string,
+    message: {
+      body: string;
+      template?: { name: string; language: string; variables: Record<string, string> };
+      /** Explicit sending number: a per-send override, else the org default. */
+      fromPhoneNumberId?: string | null;
+    },
+  ) => Promise<SendResult>
+> = {
+  whatsapp: async (env, to, message) => {
+    const client = connect("whatsapp", env as never);
+
+    // Meta wants the sending number's id, not the number.
+    const phones = metaPhones(await client.run("WHATSAPP_GET_PHONE_NUMBERS", {}));
+    const registered = phones.filter((p) => p.registered);
+    if (registered.length === 0) {
+      throw new Error(
+        "no registered WhatsApp number to send from — register one in WhatsApp setup first",
+      );
+    }
+
+    // Override → configured default → the only registered number. Never fall
+    // back to "the first one" when several exist: the number the recipient
+    // sees is not something to leave to provider ordering.
+    const from = message.fromPhoneNumberId
+      ? registered.find((p) => p.id === message.fromPhoneNumberId)
+      : registered.length === 1
+        ? registered[0]
+        : undefined;
+    if (!from) {
+      throw new Error(
+        message.fromPhoneNumberId
+          ? `phone number ${message.fromPhoneNumberId} is not registered on this account`
+          : "several registered numbers and no default — set one in WhatsApp setup",
+      );
+    }
+
+    // Digits only, no '+' — Meta rejects the plus form.
+    const toDigits = to.replace(/\D/g, "");
+
+    const result = message.template
+      ? await client.run("WHATSAPP_SEND_TEMPLATE_MESSAGE", {
+          phone_number_id: from.id,
+          to_number: toDigits,
+          template_name: message.template.name,
+          language_code: message.template.language,
+          components: templateComponents(message.template.variables),
+        })
+      : await client.run("WHATSAPP_SEND_MESSAGE", {
+          phone_number_id: from.id,
+          to_number: toDigits,
+          text: message.body,
+        });
+
+    return { externalId: wamidOf(result) };
+  },
+};
+
+/**
+ * Meta takes template variables as positional BODY parameters, in order —
+ * `{{1}}` is the first entry, not a name/value pair.
+ */
+function templateComponents(variables: Record<string, string>) {
+  const ordered = Object.keys(variables)
+    .sort((a, b) => (/^\d+$/.test(a) && /^\d+$/.test(b) ? Number(a) - Number(b) : a.localeCompare(b)))
+    .map((k) => ({ type: "text", text: variables[k] }));
+  return ordered.length ? [{ type: "body", parameters: ordered }] : [];
+}
+
+/**
+ * The wamid Meta returns for a sent message, so delivery receipts can match it.
+ *
+ * A send response is `{ contacts: [...], messages: [{ id }] }` — NOT the
+ * `{ data: [...] }` list shape, so the list unwrapper walks straight past it
+ * and yields null. Walk to `messages` explicitly instead.
+ */
+function wamidOf(result: unknown): string | null {
+  const seen = new Set<unknown>();
+  let node: unknown = result;
+  while (node && typeof node === "object" && !seen.has(node)) {
+    seen.add(node);
+    const obj = node as Record<string, unknown>;
+    if (Array.isArray(obj.messages)) {
+      const first = obj.messages[0] as { id?: unknown } | undefined;
+      return typeof first?.id === "string" ? first.id : null;
+    }
+    node = obj.data;
+  }
+  return null;
+}
+
+/* ------------------------------ channel setup ------------------------------ */
+
+const PhoneSchema = z
+  .object({
+    id: z.string(),
+    displayPhoneNumber: z.string(),
+    verifiedName: z.string(),
+    /** VERIFIED once Meta has confirmed ownership of the number. */
+    codeVerificationStatus: z.string(),
+    /** CLOUD_API once registered — anything else can't send. */
+    platformType: z.string(),
+    qualityRating: z.string(),
+    /** True when this number is ready to send. */
+    registered: z.boolean(),
+    /** True when outbound WhatsApp goes out from this number by default. */
+    isDefault: z.boolean(),
+  })
+  .openapi("Phone");
+
+api.openapi(
+  createRoute({
+    method: "get",
+    path: "/api/whatsapp/phones",
+    summary: "Numbers on the connected WhatsApp Business account",
+    description:
+      "Setup view: which numbers exist and which can actually send. A number only sends once `platformType` is CLOUD_API — until then every queued message fails at the provider, whatever the inbox says.",
+    responses: {
+      200: jsonRes(z.object({ items: z.array(PhoneSchema) }).openapi("PhoneList"), "The numbers"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      424: jsonRes(ErrorSchema, "WhatsApp isn't connected or returned an error"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const result = await connect("whatsapp", c.env as never).run("WHATSAPP_GET_PHONE_NUMBERS", {});
+      const phones = metaPhones(result);
+      const configured = await readSetting(dbFor(c.env), org, DEFAULT_PHONE_KEY);
+      const registered = phones.filter((p) => p.registered);
+      // With exactly one registered number it IS the default, implicitly —
+      // showing "no default set" there would be a chore with one right answer.
+      const effective = configured ?? (registered.length === 1 ? registered[0].id : null);
+      return c.json(
+        { items: phones.map((p) => ({ ...p, isDefault: p.id === effective })) },
+        200,
+      );
+    } catch (err) {
+      return c.json({ error: `could not reach whatsapp: ${err}` }, 424);
+    }
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "post",
+    path: "/api/whatsapp/phones/:id/default",
+    summary: "Send from this number by default",
+    description:
+      "Sets the number outbound WhatsApp leaves from. Only a registered number can be the default — an unregistered one cannot send, so making it the default would only produce failures at send time.",
+    request: { params: IdParam },
+    responses: {
+      200: jsonRes(OkSchema, "Default set"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      409: jsonRes(ErrorSchema, "That number isn't registered"),
+      424: jsonRes(ErrorSchema, "WhatsApp isn't connected or returned an error"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const { id } = c.req.valid("param");
+
+    let phones: ProviderPhone[];
+    try {
+      phones = metaPhones(
+        await connect("whatsapp", c.env as never).run("WHATSAPP_GET_PHONE_NUMBERS", {}),
+      );
+    } catch (err) {
+      return c.json({ error: `could not reach whatsapp: ${err}` }, 424);
+    }
+
+    const target = phones.find((p) => p.id === id);
+    if (!target?.registered) {
+      return c.json({ error: "that number isn't registered, so it can't send" }, 409);
+    }
+
+    const db = dbFor(c.env);
+    const now = new Date().toISOString();
+    await db
+      .insert(schema.settings)
+      .values({ orgId: org, key: DEFAULT_PHONE_KEY, value: id, updatedAt: now })
+      .onConflictDoUpdate({
+        target: [schema.settings.orgId, schema.settings.key],
+        set: { value: id, updatedAt: now },
+      });
+
+    return c.json({ ok: true }, 200);
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "post",
+    path: "/api/whatsapp/phones/:id/register",
+    summary: "Register a number with the Cloud API",
+    description:
+      "Completes Meta's registration so the number can send. The PIN is the account's two-step-verification PIN: it is forwarded to Meta and never stored, logged, or returned — losing it means using Meta's own reset flow, not asking us.",
+    request: {
+      params: IdParam,
+      body: jsonBody(
+        z
+          .object({ pin: z.string().regex(/^\d{6}$/, "PIN must be exactly 6 digits") })
+          .openapi("RegisterPhone"),
+      ),
+    },
+    responses: {
+      200: jsonRes(OkSchema, "Registered"),
+      400: jsonRes(ErrorSchema, "PIN must be 6 digits"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      424: jsonRes(ErrorSchema, "Meta rejected the registration"),
+    },
+  }),
+  async (c) => {
+    if (!orgId(c)) return c.json({ error: "unauthorized" }, 401);
+    const { id } = c.req.valid("param");
+    const { pin } = c.req.valid("json");
+    try {
+      // pin is passed straight through; never persisted and never echoed back.
+      await connect("whatsapp", c.env as never).run("WHATSAPP_REGISTER_PHONE", {
+        phone_number_id: id,
+        pin,
+      });
+      return c.json({ ok: true }, 200);
+    } catch (err) {
+      // Meta's message is the useful part ("PIN incorrect", "already
+      // registered", rate limits) — pass it on rather than a generic failure.
+      return c.json({ error: `${err}`.replace(pin, "******") }, 424);
+    }
+  },
+);
+
+/**
+ * Map Meta's phone-number rows, tolerating the broker's nesting. Knows nothing
+ * about defaults — that's this app's state, not the provider's.
+ */
+type ProviderPhone = Omit<z.infer<typeof PhoneSchema>, "isDefault">;
+
+function metaPhones(result: unknown): ProviderPhone[] {
+  return unwrapMetaRows(result).rows
+    .filter((p): p is Record<string, unknown> => !!p && typeof p === "object")
+    .map((p) => ({
+      id: String(p.id ?? ""),
+      displayPhoneNumber: String(p.display_phone_number ?? ""),
+      verifiedName: String(p.verified_name ?? ""),
+      codeVerificationStatus: String(p.code_verification_status ?? "UNKNOWN"),
+      platformType: String(p.platform_type ?? "NOT_APPLICABLE"),
+      qualityRating: String(p.quality_rating ?? "UNKNOWN"),
+      registered: String(p.platform_type ?? "") === "CLOUD_API",
+    }))
+    .filter((p) => p.id !== "");
+}
+
 /* ---------------------------------- outbox --------------------------------- */
 
 api.openapi(
@@ -621,7 +1559,7 @@ api.openapi(
     path: "/api/outbox",
     summary: "Queued replies waiting to be sent (agent only)",
     description:
-      "Outbound messages with status=queued, oldest first, with the channel and contact handle to send to. After sending each one through the channel, confirm with POST /api/messages/:id/status.",
+      "Outbound messages with status=queued, oldest first, with the channel and contact handle to send to. After sending each one through the channel, confirm with POST /api/messages/:id/status.\n\nWhen an item carries `template`, send it through the channel's TEMPLATE API with that exact name/language/variables — do NOT send `message.body` as text. The body is the rendered preview for humans; sending it as freeform is what the template exists to avoid and the provider will reject it outside the 24-hour window.",
     request: {
       query: z.object({ limit: z.coerce.number().int().min(1).max(50).default(25) }),
     },
@@ -636,6 +1574,14 @@ api.openapi(
                   channel: z.string(),
                   contact: ContactSchema,
                   subject: z.string().nullable(),
+                  /** Present ⇒ send via the template API, not as text. */
+                  template: z
+                    .object({
+                      name: z.string(),
+                      language: z.string(),
+                      variables: z.record(z.string()),
+                    })
+                    .nullable(),
                 })
                 .openapi("OutboxItem"),
             ),
@@ -667,17 +1613,58 @@ api.openapi(
           message: toMessage(r.message),
           channel: r.conv.channel,
           subject: r.conv.subject,
-          contact: {
-            id: r.contact.id,
-            channel: r.contact.channel,
-            handle: r.contact.handle,
-            name: r.contact.name,
-            avatarUrl: r.contact.avatarUrl,
-          },
+          contact: toContact(r.contact),
+          template: r.message.templateName
+            ? {
+                name: r.message.templateName,
+                language: r.message.templateLanguage ?? "",
+                variables: JSON.parse(r.message.templateVariables ?? "{}") as Record<string, string>,
+              }
+            : null,
         })),
       },
       200,
     );
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "delete",
+    path: "/api/messages/:id",
+    summary: "Discard an outbound message that never went out",
+    description:
+      "Removes a queued or failed outbound message — the draft a human changed their mind about, or one left over from an earlier send path. Deliberately refuses anything already sent: the thread is an audit trail of what the contact actually received, and a delivered message must stay in it.",
+    request: { params: IdParam },
+    responses: {
+      200: jsonRes(OkSchema, "Discarded"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      404: jsonRes(ErrorSchema, "Not found"),
+      409: jsonRes(ErrorSchema, "Already sent — cannot be discarded"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const { id } = c.req.valid("param");
+    const db = dbFor(c.env);
+
+    const [msg] = await db
+      .select()
+      .from(schema.messages)
+      .where(and(eq(schema.messages.orgId, org), eq(schema.messages.id, id)))
+      .limit(1);
+    if (!msg) return c.json({ error: "not found" }, 404);
+
+    if (msg.kind !== "outbound" || (msg.status !== "queued" && msg.status !== "failed")) {
+      return c.json(
+        { error: "only a queued or failed outbound message can be discarded" },
+        409,
+      );
+    }
+
+    await db.delete(schema.messages).where(eq(schema.messages.id, msg.id));
+    return c.json({ ok: true }, 200);
   },
 );
 

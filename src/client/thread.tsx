@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Archive, Bot, CheckCheck, RotateCcw, StickyNote, TriangleAlert } from "lucide-react";
-import type { Conversation, Message } from "./api";
-import { addComment, getMessages, patchConversation, sendReply } from "./api";
-import { Avatar, ChannelChip, timeOfDay } from "./ui";
+import {
+  Archive,
+  Bot,
+  CheckCheck,
+  FileText,
+  RotateCcw,
+  StickyNote,
+  TriangleAlert,
+} from "lucide-react";
+import type { Conversation, Message, Phone } from "./api";
+import { addComment, contactLabel, getMessages, listPhones, patchConversation, sendReply } from "./api";
+import { TemplateComposer } from "./compose";
+import { Avatar, ChannelChip, channelMeta, timeOfDay } from "./ui";
 
 const POLL_MS = 4000;
 
@@ -11,6 +20,16 @@ function OutboundStatus({ message }: { message: Message }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-warning/30 bg-warning-tint px-2 py-0.5 text-xs text-warning">
         Queued for the agent
+      </span>
+    );
+  }
+  if (message.status === "accepted") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-border bg-sunken px-2 py-0.5 text-xs text-muted"
+        title="WhatsApp accepted it for delivery. Delivery is only confirmed once receipts are wired up."
+      >
+        Accepted
       </span>
     );
   }
@@ -67,6 +86,12 @@ function MessageRow({ message }: { message: Message }) {
         <div className="flex items-center gap-1.5 text-[0.6875rem] text-faint">
           {outbound && message.authorName ? <span>{message.authorName}</span> : null}
           <span>{timeOfDay(message.createdAt)}</span>
+          {message.templateName ? (
+            <span className="inline-flex items-center gap-1 rounded-sm border border-border bg-sunken px-2 py-0.5 text-[0.6875rem] text-muted">
+              <FileText className="size-3" aria-hidden />
+              {message.templateName}
+            </span>
+          ) : null}
           {outbound ? <OutboundStatus message={message} /> : null}
         </div>
       </div>
@@ -85,6 +110,10 @@ export function ThreadPane({
   const [mode, setMode] = useState<"reply" | "note">("reply");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  /** Registered numbers we can send from — only relevant on WhatsApp. */
+  const [phones, setPhones] = useState<Phone[]>([]);
+  const [fromId, setFromId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
 
@@ -100,6 +129,30 @@ export function ThreadPane({
     const t = setInterval(() => load().catch(() => {}), POLL_MS);
     return () => clearInterval(t);
   }, [load]);
+
+  // Sending numbers, once per thread. Only WhatsApp has a choice to make, and
+  // only when more than one number is registered — otherwise the org default
+  // (or the single number) applies server-side and the picker is noise.
+  useEffect(() => {
+    if (conversation.channel !== "whatsapp") {
+      setPhones([]);
+      return;
+    }
+    let cancelled = false;
+    listPhones()
+      .then(({ items }) => {
+        if (cancelled) return;
+        const registered = items.filter((p) => p.registered);
+        setPhones(registered);
+        setFromId(registered.find((p) => p.isDefault)?.id ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setPhones([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversation.channel, conversation.id]);
 
   // Keep the newest message in view unless the reader scrolled up.
   useEffect(() => {
@@ -117,16 +170,28 @@ export function ThreadPane({
     const body = draft.trim();
     if (!body || sending) return;
     setSending(true);
+    setError(null);
     try {
-      if (mode === "reply") await sendReply(conversation.id, body);
+      if (mode === "reply") await sendReply(conversation.id, body, fromId ?? undefined);
       else await addComment(conversation.id, body);
       setDraft("");
       stickToBottom.current = true;
       await load();
       onConversationChanged();
+    } catch (err) {
+      // A 409 here means the window lapsed while the draft was open — the
+      // composer re-renders into template mode once the parent refreshes.
+      setError(err instanceof Error ? err.message : "Could not queue the reply.");
+      onConversationChanged();
     } finally {
       setSending(false);
     }
+  }
+
+  async function afterTemplateSent() {
+    stickToBottom.current = true;
+    await load();
+    onConversationChanged();
   }
 
   async function toggleStatus() {
@@ -138,6 +203,9 @@ export function ThreadPane({
 
   const contact = conversation.contact;
   const closed = conversation.status === "closed";
+  const channelLabel = channelMeta(conversation.channel).label;
+  /** Notes are always freeform — only an outbound reply is window-gated. */
+  const templateOnly = mode === "reply" && !conversation.window.freeformAllowed;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background">
@@ -147,9 +215,15 @@ export function ThreadPane({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h1 className="truncate text-[1.25rem] font-bold leading-tight tracking-[-0.01em]">
-              {contact.name ?? contact.handle}
+              {contactLabel(contact)}
             </h1>
             <ChannelChip channel={conversation.channel} />
+            {conversation.window.freeformAllowed ? null : (
+              <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-warning/30 bg-warning-tint px-2 py-0.5 text-xs font-normal text-warning">
+                <FileText className="size-3" aria-hidden />
+                Template only
+              </span>
+            )}
           </div>
           <p className="truncate text-xs text-muted">
             {contact.handle}
@@ -203,52 +277,106 @@ export function ThreadPane({
               ))}
             </div>
             {mode === "reply" ? (
-              <span className="text-[0.6875rem] text-faint">Sent by your agent via {conversation.channel}</span>
+              <div className="flex items-center gap-2">
+                {templateOnly ? (
+                  <span className="text-[0.6875rem] text-faint">
+                    Template required — window closed
+                  </span>
+                ) : null}
+                {phones.length > 1 ? (
+                  <label className="flex items-center gap-1.5 text-[0.6875rem] text-faint">
+                    From
+                    <select
+                      value={fromId ?? ""}
+                      onChange={(e) => setFromId(e.target.value || null)}
+                      aria-label="Send from which number"
+                      className="h-7 rounded-sm border border-border bg-surface px-1.5 text-[0.6875rem] text-foreground outline-none focus:border-ring"
+                    >
+                      {phones.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.displayPhoneNumber}
+                          {p.isDefault ? " (default)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : templateOnly ? null : (
+                  <span className="text-[0.6875rem] text-faint">
+                    Sent via {conversation.channel}
+                  </span>
+                )}
+              </div>
             ) : (
               <span className="text-[0.6875rem] text-faint">Never delivered to the contact</span>
             )}
           </div>
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                submit();
-              }
-            }}
-            rows={2}
-            placeholder={
-              mode === "reply"
-                ? `Reply to ${contact.name ?? contact.handle}…`
-                : "Add a note for your team and your agent…"
-            }
-            aria-label={mode === "reply" ? "Reply" : "Internal note"}
-            className="w-full resize-none bg-transparent px-3 py-2.5 text-sm text-foreground outline-none placeholder:text-faint"
-          />
-          <div className="flex items-center justify-end px-3 pb-2.5">
-            {mode === "reply" ? (
-              <button
-                type="button"
-                onClick={submit}
-                disabled={sending || draft.trim() === ""}
-                aria-label="Queue reply for sending"
-                className="inline-flex h-8 items-center gap-x-1.5 rounded-sm bg-primary px-2 text-sm font-medium text-on-primary transition-colors duration-150 hover:bg-primary-hover disabled:opacity-50"
-              >
-                {sending ? "Queueing…" : "Send"}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={submit}
-                disabled={sending || draft.trim() === ""}
-                aria-label="Add internal note"
-                className="inline-flex h-8 items-center gap-x-1.5 rounded-sm border border-border bg-surface px-2 text-sm font-medium text-foreground transition-colors duration-150 hover:bg-sunken disabled:opacity-50"
-              >
-                {sending ? "Saving…" : "Add note"}
-              </button>
-            )}
-          </div>
+
+          {templateOnly ? (
+            <div className="px-3 py-3">
+              <p className="mb-3 flex items-start gap-1.5 text-[0.8125rem] leading-[1.45] text-muted">
+                <FileText className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                <span>
+                  {conversation.window.lastInboundAt
+                    ? `${contactLabel(contact)} last wrote over 24 hours ago, so ${channelLabel} only accepts an approved template now.`
+                    : `${contactLabel(contact)} hasn't written yet, so ${channelLabel} only accepts an approved template to open the conversation.`}
+                </span>
+              </p>
+              <TemplateComposer
+                conversation={conversation}
+                fromPhoneNumberId={fromId}
+                onSent={afterTemplateSent}
+              />
+            </div>
+          ) : (
+            <>
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submit();
+                  }
+                }}
+                rows={2}
+                placeholder={
+                  mode === "reply"
+                    ? `Reply to ${contactLabel(contact)}…`
+                    : "Add a note for your team and your agent…"
+                }
+                aria-label={mode === "reply" ? "Reply" : "Internal note"}
+                className="w-full resize-none bg-transparent px-3 py-2.5 text-sm text-foreground outline-none placeholder:text-faint"
+              />
+              {error ? (
+                <p role="alert" className="px-3 pb-1 text-[0.8125rem] leading-[1.45] text-danger">
+                  {error}
+                </p>
+              ) : null}
+              <div className="flex items-center justify-end px-3 pb-2.5">
+                {mode === "reply" ? (
+                  <button
+                    type="button"
+                    onClick={submit}
+                    disabled={sending || draft.trim() === ""}
+                    aria-label="Queue reply for sending"
+                    className="inline-flex h-8 items-center gap-x-1.5 rounded-sm bg-primary px-2 text-sm font-medium text-on-primary transition-colors duration-150 hover:bg-primary-hover disabled:opacity-50"
+                  >
+                    {sending ? "Queueing…" : "Send"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={submit}
+                    disabled={sending || draft.trim() === ""}
+                    aria-label="Add internal note"
+                    className="inline-flex h-8 items-center gap-x-1.5 rounded-sm border border-border bg-surface px-2 text-sm font-medium text-foreground transition-colors duration-150 hover:bg-sunken disabled:opacity-50"
+                  >
+                    {sending ? "Saving…" : "Add note"}
+                  </button>
+                )}
+              </div>
+            </>
+          )}
         </div>
       </footer>
     </section>

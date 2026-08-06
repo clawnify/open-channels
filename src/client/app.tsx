@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Archive, Inbox, Search } from "lucide-react";
+import { Archive, Inbox, PenLine, Search, Settings } from "lucide-react";
 import type { Conversation, Stats } from "./api";
-import { getStats, listConversations, patchConversation } from "./api";
+import { contactLabel, getStats, listConversations, patchConversation } from "./api";
+import { NewConversationDialog } from "./compose";
+import { WhatsAppSetup } from "./setup";
 import { ThreadPane } from "./thread";
 import { Avatar, CHANNELS, ChannelMark, Eyebrow, channelMeta, timeAgo } from "./ui";
 
@@ -9,7 +11,11 @@ const POLL_MS = 5000;
 const PAGE_SIZE = 50;
 
 /** Sidebar filter: the whole inbox, one channel, or the closed archive. */
-type Filter = { kind: "all" } | { kind: "channel"; channel: string } | { kind: "closed" };
+type Filter =
+  | { kind: "all" }
+  | { kind: "channel"; channel: string }
+  | { kind: "closed" }
+  | { kind: "setup" };
 
 function SidebarRow({
   active,
@@ -128,15 +134,16 @@ function Sidebar({
             label="Closed"
             ariaLabel="Show closed conversations"
           />
+          <SidebarRow
+            active={filter.kind === "setup"}
+            onClick={() => setFilter({ kind: "setup" })}
+            icon={<Settings className="size-4" aria-hidden />}
+            label="WhatsApp setup"
+            ariaLabel="Open WhatsApp setup"
+          />
         </div>
       </nav>
 
-      <div className="border-t border-border p-3">
-        <p className="px-1.5 text-[0.6875rem] leading-relaxed text-faint">
-          Replies are sent by your AI employee through its own channels — this inbox never
-          messages anyone directly.
-        </p>
-      </div>
     </aside>
   );
 }
@@ -150,7 +157,7 @@ function ConversationRow({
   active: boolean;
   onClick: () => void;
 }) {
-  const name = conversation.contact.name ?? conversation.contact.handle;
+  const name = contactLabel(conversation.contact);
   return (
     <button
       type="button"
@@ -197,6 +204,9 @@ export function App() {
   const [conversations, setConversations] = useState<Conversation[] | null>(null);
   const [total, setTotal] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [showNew, setShowNew] = useState(false);
+  /** A just-opened thread, so it renders before the list has refetched. */
+  const [pending, setPending] = useState<Conversation | null>(null);
   const searchDebounce = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [debouncedSearch, setDebouncedSearch] = useState("");
 
@@ -215,6 +225,8 @@ export function App() {
   }, [search]);
 
   const load = useCallback(async () => {
+    // Setup is not a conversation view — don't poll the inbox behind it.
+    if (filter.kind === "setup") return;
     const params = {
       status: filter.kind === "closed" ? "closed" : "open",
       channel: filter.kind === "channel" ? filter.channel : undefined,
@@ -238,9 +250,23 @@ export function App() {
   }, [load]);
 
   const selected = useMemo(
-    () => conversations?.find((c) => c.id === selectedId) ?? null,
-    [conversations, selectedId],
+    () =>
+      conversations?.find((c) => c.id === selectedId) ??
+      (pending?.id === selectedId ? pending : null),
+    [conversations, selectedId, pending],
   );
+
+  /**
+   * Show the thread the user just opened. Resets the filter to the whole inbox
+   * so a brand-new thread can't land outside the current channel/search view.
+   */
+  function openStarted(conversation: Conversation) {
+    setShowNew(false);
+    setPending(conversation);
+    setSelectedId(conversation.id);
+    setSearch("");
+    setFilter({ kind: "all" });
+  }
 
   async function select(conversation: Conversation) {
     setSelectedId(conversation.id);
@@ -248,6 +274,15 @@ export function App() {
       await patchConversation(conversation.id, { unread: 0 }).catch(() => {});
       load().catch(() => {});
     }
+  }
+
+  if (filter.kind === "setup") {
+    return (
+      <div className="flex h-full bg-background font-sans text-foreground">
+        <Sidebar stats={stats} filter={filter} setFilter={setFilter} />
+        <WhatsAppSetup />
+      </div>
+    );
   }
 
   const listTitle =
@@ -263,10 +298,19 @@ export function App() {
 
       {/* Conversation list */}
       <section className="flex w-[22rem] shrink-0 flex-col border-r border-border bg-surface">
-        <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
+        <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
           <Eyebrow>
             {listTitle} · {total}
           </Eyebrow>
+          <button
+            type="button"
+            onClick={() => setShowNew(true)}
+            aria-label="Start a new conversation"
+            className="inline-flex h-8 shrink-0 items-center gap-x-1.5 rounded-sm border border-border bg-surface px-2 text-sm font-medium text-foreground transition-colors duration-150 hover:bg-sunken"
+          >
+            <PenLine className="size-4" aria-hidden />
+            New
+          </button>
         </div>
         <div className="shrink-0 border-b border-border p-3">
           <div className="flex h-9 items-center gap-2 rounded-sm border border-border bg-surface px-2.5 focus-within:border-ring">
@@ -314,9 +358,22 @@ export function App() {
           <div className="text-center">
             <Inbox className="mx-auto size-6 text-faint" aria-hidden />
             <p className="mt-3 text-sm text-muted">Select a conversation to read the thread.</p>
+            <button
+              type="button"
+              onClick={() => setShowNew(true)}
+              aria-label="Start a new conversation"
+              className="mt-4 inline-flex h-8 items-center gap-x-1.5 rounded-sm bg-primary px-2 text-sm font-medium text-on-primary transition-colors duration-150 hover:bg-primary-hover"
+            >
+              <PenLine className="size-4" aria-hidden />
+              New conversation
+            </button>
           </div>
         </section>
       )}
+
+      {showNew ? (
+        <NewConversationDialog onClose={() => setShowNew(false)} onOpened={openStarted} />
+      ) : null}
     </div>
   );
 }
