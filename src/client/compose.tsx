@@ -418,7 +418,7 @@ export function NewConversationDialog({
             </div>
             <div className="space-y-1">
               <label htmlFor="nc-name" className="block text-xs font-semibold tracking-[0.04em] text-muted">
-                Display name (optional)
+                Their name (optional)
               </label>
               <input
                 id="nc-name"
@@ -427,6 +427,12 @@ export function NewConversationDialog({
                 placeholder="Kara Finley"
                 className="h-9 w-full rounded-sm border border-border bg-surface px-2.5 text-[0.8125rem] text-foreground outline-none transition-colors duration-150 focus:border-ring placeholder:text-faint"
               />
+              {/* "Display name" is Meta's term for the BUSINESS name recipients
+                  see — using it here read as though this set our own. */}
+              <p className="text-[0.6875rem] leading-relaxed text-faint">
+                Only labels this thread in your inbox. Leave it blank and their
+                WhatsApp profile name fills it in once they reply.
+              </p>
             </div>
             {channel === "email" ? (
               <div className="space-y-1">
