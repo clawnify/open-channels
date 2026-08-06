@@ -56,7 +56,7 @@ export function ChannelChip({ channel }: { channel: string }) {
 }
 
 const initials = (contact: Contact) => {
-  const source = contact.name ?? contact.handle;
+  const source = contact.name ?? contact.profileName ?? contact.handle;
   const parts = source.replace(/^[+@]/, "").split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();

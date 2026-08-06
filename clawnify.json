@@ -7,6 +7,7 @@
   "app": {
     "framework": "react+hono",
     "database": true,
-    "storage": false
+    "storage": false,
+    "credentials": ["whatsapp"]
   }
 }
