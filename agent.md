@@ -80,6 +80,61 @@ itself, so you don't have to reason about it:
 - The app keeps its own catalogue fresh from the connected integration, so
   "there are no templates" is an integration problem, not a sync you owe.
 
+## People: this inbox is not the CRM
+
+A contact row here is a **channel identity** — one address on one channel. The
+same human on WhatsApp and email is two rows. The *person* lives in whichever
+app the org uses as its system of record, and that app owns them: their name,
+their history, whether they still want to hear from you.
+
+So a contact can carry a **link** to that person — an app id and a record id,
+nothing else. Never copy the record in. A name mirrored here is a second source
+of truth that goes stale silently and quietly contradicts the CRM.
+
+**Configure it once** with `PUT /api/profile-source`. Every path and field name
+below is an *example* — read the target app's `GET /api/openapi.json` and use
+what it actually serves. One org's people app calls them customers, another's
+calls them members, and the two disagree about everything else too:
+
+```json
+{ "appId": "<the sibling app's uuid>", "label": "Customers",
+  "search": { "path": "/api/customers", "query": "q", "collection": "items" },
+  "get":    { "path": "/api/customers/{ref}", "collection": "customer" },
+  "fields": { "ref": "id", "name": "full_name", "phone": "mobile", "email": "email" },
+  "profileUrl": "https://<that app>.apps.clawnify.com/customers/{ref}" }
+```
+
+Three things people get wrong:
+
+- **`collection` is per operation, not per app.** A list endpoint returning
+  `{"items": [...]}` and a detail endpoint returning `{"customer": {...}}` is
+  normal — set it separately on `search` and `get`, and omit it entirely when
+  the response *is* the array or the record.
+- **`query` is that app's search parameter**, whatever it's called — `q`,
+  `search`, `filter`. Get it from the spec, not from habit.
+- **`fields` maps meaning onto their names.** `fields.ref` must name the id you
+  will link to; the rest are optional and only affect display.
+
+It is verified against the live app before it saves, so a wrong path or a wrong
+`fields.ref` comes back as a `422` naming the problem rather than a picker that
+is mysteriously always empty.
+
+**Then link contacts as you learn who they are.** On ingest, add
+`contact.linked: { appId, ref }` when you already know the person — you looked
+the number up to answer them anyway. Only when you *know*:
+
+- A confident match on a full phone number or email address is a link.
+- A name that merely looks similar is **not**. Two people share a surname; a
+  household shares a phone. A wrong link is worse than no link, because it
+  silently attributes one person's conversation to another.
+- Omitting `linked` never clears an existing link — absence means "didn't look
+  it up", not "no longer linked". To correct a bad link, send the right one.
+
+Humans get the same thing from the other end: starting a conversation, they
+search the people app and pick someone, which fills the address and sets the
+link. `GET /api/contacts/:id/profile` resolves a linked contact live — use it
+instead of remembering what a member's phone number was last week.
+
 ## Pages
 
 - `/` — the inbox (sidebar → conversation list → thread). Screenshot-friendly.
@@ -104,3 +159,10 @@ there when needed: `GET /api/conversations` (paginated, `?search=`),
 - `422` on reply — the template is unknown, not `APPROVED`, or missing variable
   values. Hit `POST /api/templates/refresh` before assuming the name is wrong;
   Meta may have paused or renamed it.
+- `422` on `PUT /api/profile-source` — the target app didn't answer as described.
+  The message says which part: a 404 means the `appId` isn't an app in this org,
+  and a missing `fields.ref` means you named a field the records don't have.
+- `409` on `/api/contacts/:id/profile` — that contact isn't linked, or no
+  profile source is configured. Not an error to retry.
+- `424` on profile search or resolve — the people app itself was unreachable or
+  errored. The inbox keeps working; only the lookup is down.

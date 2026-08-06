@@ -37,6 +37,23 @@ export const contacts = sqliteTable(
      */
     profileName: text("profile_name"),
     avatarUrl: text("avatar_url"),
+    /**
+     * The person this channel identity belongs to, in the org's own system of
+     * record — a sibling Clawnify app (its UUID) and the record's id there.
+     *
+     * This row is a *channel identity* (unique per org+channel+handle), not a
+     * person: the same human on WhatsApp and email is two rows. The org's CRM
+     * owns the person. So we store a link, never a copy — no name, no notes,
+     * no phone mirrored here. Display data is read live through the app-to-app
+     * proxy so it cannot go stale, and deleting the CRM record breaks the link
+     * loudly instead of leaving a plausible-looking fossil behind.
+     *
+     * Stored as the app's platform UUID rather than a free-text source name so
+     * it stays resolvable and validatable. Both null until someone links this
+     * contact; nothing in the inbox requires them.
+     */
+    linkedAppId: text("linked_app_id"),
+    linkedRef: text("linked_ref"),
     createdAt: text("created_at").notNull().$default(() => new Date().toISOString()),
   },
   (t) => ({

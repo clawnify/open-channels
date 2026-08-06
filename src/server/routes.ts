@@ -4,7 +4,11 @@ import { getDB, and, or, eq, desc, asc, lt, like, count, sql, inArray } from "@c
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import * as schema from "./schema";
 
-type Env = { Bindings: { DB: D1Database } };
+// CLAWNIFY_TOKEN is the org service token, injected as a secret on every
+// deploy. It is how this app reaches a sibling app in the same org (see
+// callSibling). Optional in the type because a never-redeployed app predates
+// the injection — the code degrades to "no profile source" rather than 500ing.
+type Env = { Bindings: { DB: D1Database; CLAWNIFY_TOKEN?: string } };
 const api = new OpenAPIHono<Env>();
 
 // getDB returns a D1 | Facet union whose generic select(fields) overloads
@@ -365,6 +369,12 @@ const toContact = (contact: typeof schema.contacts.$inferSelect) => ({
   name: contact.name,
   profileName: contact.profileName,
   avatarUrl: contact.avatarUrl,
+  // The link only — never the linked record. Resolving every contact's profile
+  // to render a list would be one proxy call per row; the client asks for a
+  // profile when it actually shows one.
+  linked: contact.linkedAppId && contact.linkedRef
+    ? { appId: contact.linkedAppId, ref: contact.linkedRef }
+    : null,
 });
 
 const toConversation = (
@@ -432,6 +442,12 @@ const IngestSchema = z
       handle: z.string().min(1),
       name: z.string().optional(),
       avatarUrl: z.string().url().optional(),
+      /**
+       * The person this handle belongs to in the org's system of record. Set it
+       * when you already know — you looked the number up to answer the message
+       * anyway. Never guessed: a wrong link is worse than none.
+       */
+      linked: z.object({ appId: z.string().min(1), ref: z.string().min(1) }).optional(),
     }),
     message: z.object({
       kind: z.enum(["inbound", "outbound"]).default("inbound"),
@@ -498,11 +514,14 @@ api.openapi(
           // Provider-supplied → profileName. `name` is the human's to set.
           profileName: input.contact.name ?? null,
           avatarUrl: input.contact.avatarUrl ?? null,
+          linkedAppId: input.contact.linked?.appId ?? null,
+          linkedRef: input.contact.linked?.ref ?? null,
         })
         .returning();
     } else if (
       (input.contact.name && input.contact.name !== contact.profileName) ||
-      (input.contact.avatarUrl && input.contact.avatarUrl !== contact.avatarUrl)
+      (input.contact.avatarUrl && input.contact.avatarUrl !== contact.avatarUrl) ||
+      (input.contact.linked && input.contact.linked.ref !== contact.linkedRef)
     ) {
       [contact] = await db
         .update(schema.contacts)
@@ -510,6 +529,10 @@ api.openapi(
           // Only the profile name — a curated `name` outlives every inbound.
           profileName: input.contact.name ?? contact.profileName,
           avatarUrl: input.contact.avatarUrl ?? contact.avatarUrl,
+          // An existing link is never cleared by an ingest that omits one:
+          // absence here means "didn't look it up", not "no longer linked".
+          linkedAppId: input.contact.linked?.appId ?? contact.linkedAppId,
+          linkedRef: input.contact.linked?.ref ?? contact.linkedRef,
         })
         .where(eq(schema.contacts.id, contact.id))
         .returning();
@@ -657,6 +680,213 @@ api.openapi(
   },
 );
 
+const ProfileSchema = z
+  .object({
+    ref: z.string().nullable(),
+    name: z.string().nullable(),
+    phone: z.string().nullable(),
+    email: z.string().nullable(),
+    profileUrl: z.string().nullable(),
+  })
+  .openapi("Profile");
+
+const ProfileSourceSchema = z
+  .object({
+    appId: z.string().min(1),
+    label: z.string().optional(),
+    search: z.object({
+      path: z.string().min(1),
+      query: z.string().min(1),
+      collection: z.string().optional(),
+    }),
+    get: z.object({ path: z.string().min(1), collection: z.string().optional() }).optional(),
+    fields: z.object({
+      ref: z.string().min(1),
+      name: z.string().optional(),
+      phone: z.string().optional(),
+      email: z.string().optional(),
+    }),
+    profileUrl: z.string().optional(),
+  })
+  .openapi("ProfileSource");
+
+api.openapi(
+  createRoute({
+    method: "get",
+    path: "/api/profile-source",
+    summary: "The org's configured system of record for people",
+    description:
+      "Which sibling app this inbox looks people up in, and how its fields map. Null when nothing is configured — the inbox works fine without it, contacts just show their handle.",
+    responses: {
+      200: jsonRes(
+        z.object({ source: ProfileSourceSchema.nullable() }).openapi("ProfileSourceResult"),
+        "Current configuration",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ source: await readProfileSource(dbFor(c.env), org) }, 200);
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "put",
+    path: "/api/profile-source",
+    summary: "Point this inbox at the org's people app",
+    description:
+      "Set which sibling Clawnify app holds the org's people and how to read it. The agent can write this once after reading the target app's /api/openapi.json; a human can correct it. Verified against the live app before saving, so a wrong appId or path fails here rather than silently at search time.",
+    request: { body: jsonBody(ProfileSourceSchema) },
+    responses: {
+      200: jsonRes(
+        z.object({ ok: z.boolean(), sampled: z.number() }).openapi("ProfileSourceSaved"),
+        "Saved and verified",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      422: jsonRes(ErrorSchema, "The target app did not answer as described"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const src = c.req.valid("json") as ProfileSource;
+
+    // Prove the config before storing it. A search that returns rows without
+    // the declared `ref` field is a mapping error, and finding that out now is
+    // the difference between one clear 422 and a picker that is mysteriously
+    // always empty.
+    let sampled = 0;
+    try {
+      const sep = src.search.path.includes("?") ? "&" : "?";
+      const body = await callSibling(
+        c.env,
+        src.appId,
+        `${src.search.path}${sep}${encodeURIComponent(src.search.query)}=&limit=1`,
+      );
+      const rows = collectionOf(body, src.search.collection);
+      sampled = rows.length;
+      if (rows.length && !str(rows[0][src.fields.ref])) {
+        return c.json(
+          {
+            error: `records from ${src.search.path} have no "${src.fields.ref}" field — fields.ref must name the record's id`,
+          },
+          422,
+        );
+      }
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 422);
+    }
+
+    const now = new Date().toISOString();
+    await dbFor(c.env)
+      .insert(schema.settings)
+      .values({ orgId: org, key: PROFILE_SOURCE_KEY, value: JSON.stringify(src), updatedAt: now })
+      .onConflictDoUpdate({
+        target: [schema.settings.orgId, schema.settings.key],
+        set: { value: JSON.stringify(src), updatedAt: now },
+      });
+
+    return c.json({ ok: true, sampled }, 200);
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "get",
+    path: "/api/profile-source/search",
+    summary: "Search the org's people app",
+    description:
+      "Type-ahead over the configured system of record, so a human starting a conversation picks a known person instead of typing a phone number. Returns [] when no profile source is configured.",
+    request: { query: z.object({ q: z.string().optional(), limit: z.string().optional() }) },
+    responses: {
+      200: jsonRes(
+        z.object({ items: z.array(ProfileSchema) }).openapi("ProfileSearchResult"),
+        "Matching people",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      424: jsonRes(ErrorSchema, "The people app could not be reached"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const src = await readProfileSource(dbFor(c.env), org);
+    if (!src) return c.json({ items: [] }, 200);
+
+    const { q, limit } = c.req.valid("query");
+    const n = Math.min(25, Math.max(1, Number(limit) || 10));
+    const sep = src.search.path.includes("?") ? "&" : "?";
+    const path = `${src.search.path}${sep}${encodeURIComponent(src.search.query)}=${encodeURIComponent(
+      q ?? "",
+    )}&limit=${n}`;
+
+    try {
+      const rows = collectionOf(await callSibling(c.env, src.appId, path), src.search.collection);
+      // Drop records with no id — they cannot be linked to, so offering them
+      // would produce a contact pointing at nothing.
+      return c.json({ items: rows.map((r) => toProfile(r, src)).filter((p) => p.ref) }, 200);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 424);
+    }
+  },
+);
+
+api.openapi(
+  createRoute({
+    method: "get",
+    path: "/api/contacts/{id}/profile",
+    summary: "Resolve one contact's linked person, live",
+    description:
+      "Reads the linked record from the org's people app on demand. Never cached here: the CRM owns the person, so a stale copy in the inbox would be a second source of truth. 409 when the contact is not linked.",
+    request: { params: z.object({ id: z.string() }) },
+    responses: {
+      200: jsonRes(ProfileSchema, "The linked person"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      404: jsonRes(ErrorSchema, "No such contact"),
+      409: jsonRes(ErrorSchema, "Contact is not linked, or no profile source configured"),
+      424: jsonRes(ErrorSchema, "The people app could not be reached"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const db = dbFor(c.env);
+
+    const [contact] = await db
+      .select()
+      .from(schema.contacts)
+      .where(and(eq(schema.contacts.orgId, org), eq(schema.contacts.id, c.req.valid("param").id)))
+      .limit(1);
+    if (!contact) return c.json({ error: "no such contact" }, 404);
+    if (!contact.linkedAppId || !contact.linkedRef) {
+      return c.json({ error: "this contact is not linked to a person" }, 409);
+    }
+
+    const src = await readProfileSource(db, org);
+    if (!src?.get) {
+      return c.json({ error: "no profile source with a `get` path is configured" }, 409);
+    }
+    // The contact's own appId wins over the configured one: a contact linked
+    // before the org repointed its profile source must still resolve.
+    const path = src.get.path.replace("{ref}", encodeURIComponent(contact.linkedRef));
+    try {
+      const body = await callSibling(c.env, contact.linkedAppId, path);
+      const row = src.get.collection
+        ? ((body as Record<string, unknown>)[src.get.collection] as Record<string, unknown>)
+        : (body as Record<string, unknown>);
+      if (!row || typeof row !== "object") {
+        return c.json({ error: "linked person not found in the people app" }, 424);
+      }
+      return c.json(toProfile(row, src), 200);
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 424);
+    }
+  },
+);
+
 api.openapi(
   createRoute({
     method: "post",
@@ -672,6 +902,8 @@ api.openapi(
             handle: z.string().min(1),
             name: z.string().optional(),
             subject: z.string().optional(),
+            /** Set when the human picked a known person rather than typing a handle. */
+            linked: z.object({ appId: z.string().min(1), ref: z.string().min(1) }).optional(),
           })
           .openapi("StartConversation"),
       ),
@@ -707,12 +939,23 @@ api.openapi(
           channel: input.channel,
           handle: input.handle,
           name: input.name ?? null,
+          linkedAppId: input.linked?.appId ?? null,
+          linkedRef: input.linked?.ref ?? null,
         })
         .returning();
-    } else if (input.name && input.name !== contact.name) {
+    } else if (
+      (input.name && input.name !== contact.name) ||
+      (input.linked && input.linked.ref !== contact.linkedRef)
+    ) {
       [contact] = await db
         .update(schema.contacts)
-        .set({ name: input.name })
+        .set({
+          name: input.name ?? contact.name,
+          // Re-linking an existing contact is legitimate — a handle typed by
+          // hand last week is the person you just picked from the CRM today.
+          linkedAppId: input.linked?.appId ?? contact.linkedAppId,
+          linkedRef: input.linked?.ref ?? contact.linkedRef,
+        })
         .where(eq(schema.contacts.id, contact.id))
         .returning();
     }
@@ -1283,6 +1526,111 @@ type SendResult = { externalId: string | null };
 
 /** Which number outbound WhatsApp leaves from. */
 const DEFAULT_PHONE_KEY = "whatsapp_default_phone_number_id";
+
+// ── Profile source: the org's system of record for people ───────────────────
+//
+// The inbox stores channel identities, not people. The org's CRM stores people.
+// This is the seam between them, and it is deliberately *configuration* rather
+// than code: this app is a public template, so it cannot know which app an org
+// uses as its CRM, what its routes are called, or which field holds a phone
+// number. One org points it at a members app, another at a customers app.
+//
+// It is config and not a table because it has no lifecycle — one value per org,
+// last write wins, nothing to revoke or audit. The *link* on a contact row is
+// the opposite: a durable fact about one person, so that gets columns.
+//
+// Every key here exists because a real app differs on it — `collection` because
+// some APIs return a bare array and some wrap it, `query` because the search
+// parameter is `search` in one app and `q` in the next. Resist adding keys for
+// differences nobody has hit; a mapping DSL is not the goal.
+const PROFILE_SOURCE_KEY = "profile_source";
+
+interface ProfileSource {
+  /** Sibling app's platform UUID — must be in this org. */
+  appId: string;
+  /** Human label for the UI — the app's own name, e.g. "Customers". */
+  label?: string;
+  /** How to search it. `collection` names the array key in the response body. */
+  search: { path: string; query: string; collection?: string };
+  /** How to fetch one record. `{ref}` is substituted. */
+  get?: { path: string; collection?: string };
+  /** Which response fields carry which meaning. `ref` is the record's id. */
+  fields: { ref: string; name?: string; phone?: string; email?: string };
+  /** Optional deep link for humans; `{ref}` is substituted. */
+  profileUrl?: string;
+}
+
+const readProfileSource = async (db: DB, org: string): Promise<ProfileSource | null> => {
+  const raw = await readSetting(db, org, PROFILE_SOURCE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as ProfileSource;
+    // A half-written config is worse than none: it would fail deep inside a
+    // proxy call with an opaque message instead of here.
+    return parsed?.appId && parsed?.search?.path && parsed?.fields?.ref ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Call a sibling app in this org through the platform's app-to-app proxy.
+ *
+ * Auth is this app's own injected CLAWNIFY_TOKEN — the org service token. The
+ * callee sees Caller "app" with no user identity, so it must not be relied on
+ * for per-user gating on the other side. The platform scopes the app lookup to
+ * our org, so a mis-typed appId is a 404, never another tenant's data.
+ */
+const callSibling = async (
+  env: Env["Bindings"],
+  appId: string,
+  path: string,
+): Promise<unknown> => {
+  const token = env.CLAWNIFY_TOKEN;
+  if (!token) {
+    throw new Error("this app has no CLAWNIFY_TOKEN — redeploy it to pick one up");
+  }
+  const res = await fetch(`https://provision.clawnify.com/v1/apps/${appId}/proxy${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    // Surface the sibling's own words — "App not found." reads very differently
+    // from a 500 in its handler, and the operator needs to tell them apart.
+    const detail = text.slice(0, 200);
+    throw new Error(
+      res.status === 404
+        ? `profile source app not found in this org (${appId}) — check the configured appId`
+        : `profile source returned ${res.status}: ${detail}`,
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("profile source did not return JSON");
+  }
+};
+
+/** Pull the record array out of a response that may or may not wrap it. */
+const collectionOf = (body: unknown, key?: string): Record<string, unknown>[] => {
+  const raw = key ? (body as Record<string, unknown>)?.[key] : body;
+  return Array.isArray(raw) ? (raw as Record<string, unknown>[]) : [];
+};
+
+const str = (v: unknown): string | null =>
+  typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" ? String(v) : null;
+
+/** Project one sibling record onto the shape the inbox understands. */
+const toProfile = (row: Record<string, unknown>, src: ProfileSource) => ({
+  ref: str(row[src.fields.ref]),
+  name: src.fields.name ? str(row[src.fields.name]) : null,
+  phone: src.fields.phone ? str(row[src.fields.phone]) : null,
+  email: src.fields.email ? str(row[src.fields.email]) : null,
+  profileUrl:
+    src.profileUrl && str(row[src.fields.ref])
+      ? src.profileUrl.replace("{ref}", encodeURIComponent(String(row[src.fields.ref])))
+      : null,
+});
 
 const readSetting = async (db: DB, org: string, key: string): Promise<string | null> => {
   const [row] = await db

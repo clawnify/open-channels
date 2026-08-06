@@ -9,6 +9,21 @@ export interface Contact {
   /** The contact's own channel profile name, refreshed from inbound. */
   profileName: string | null;
   avatarUrl: string | null;
+  /**
+   * The person this channel identity belongs to in the org's people app. The
+   * link only — fetch the record itself with getContactProfile when you show
+   * it, so the inbox never renders a stale copy of someone else's data.
+   */
+  linked: { appId: string; ref: string } | null;
+}
+
+/** One person as the org's system of record describes them. */
+export interface Profile {
+  ref: string | null;
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  profileUrl: string | null;
 }
 
 /**
@@ -153,8 +168,27 @@ export const startConversation = (input: {
   handle: string;
   name?: string;
   subject?: string;
+  linked?: { appId: string; ref: string };
 }): Promise<Conversation> =>
   request("/api/conversations", { method: "POST", body: JSON.stringify(input) });
+
+export interface ProfileSource {
+  appId: string;
+  label?: string;
+  fields: { ref: string; name?: string; phone?: string; email?: string };
+}
+
+/** Null when the org hasn't pointed the inbox at a people app. */
+export const getProfileSource = (): Promise<{ source: ProfileSource | null }> =>
+  request("/api/profile-source");
+
+/** Type-ahead over the org's people app. Empty when none is configured. */
+export const searchProfiles = (q: string, limit = 8): Promise<{ items: Profile[] }> =>
+  request(`/api/profile-source/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+
+/** Resolve one contact's linked person, live from the people app. */
+export const getContactProfile = (contactId: string): Promise<Profile> =>
+  request(`/api/contacts/${contactId}/profile`);
 
 export interface Phone {
   id: string;

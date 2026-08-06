@@ -29,6 +29,10 @@ WhatsApp / Telegram / Slack / Email
 - Three-pane inbox: channels sidebar (live counts) → conversation list (search, unread) → thread
 - One conversation per contact, closed threads reopen automatically on new inbound
 - Queued / sent / failed delivery states on every outgoing reply
+- Start a conversation by searching the people app you already have — point the
+  inbox at it once and pick a person instead of typing a phone number. Contacts
+  link to that record rather than copying it, so your CRM stays the one place a
+  person's details live
 - Multi-tenant by construction (org-scoped rows, platform-injected identity)
 - Dark mode, agent mode (`?agent`), keyboard-friendly composer
 
