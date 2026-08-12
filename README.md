@@ -58,7 +58,7 @@ The Vite proxy injects a local dev identity; seed data by curling `POST /api/ing
 
 ## Stack
 
-Hono + React + Vite + D1 (Drizzle) on Cloudflare Workers — the standard Clawnify app template. API surface is OpenAPI-typed and self-documented at `/llms.txt` and `/api/openapi.json`.
+Hono API + React + Vite over a SQLite database (Drizzle) — the standard Clawnify app template. API surface is OpenAPI-typed and self-documented at `/llms.txt` and `/api/openapi.json`.
 
 ## License
 

@@ -79,6 +79,9 @@ export interface Template {
   bodyText: string;
   /** Placeholder tokens in bodyText, in order: ["1","2"] or ["first_name"]. */
   variables: string[];
+  /** The provider's own component array — carries the example values an edit
+   *  has to send back, and the header/footer/buttons an edit leaves alone. */
+  components: unknown[];
   syncedAt: string;
 }
 
@@ -219,10 +222,58 @@ export const registerPhone = (id: string, pin: string): Promise<{ ok: boolean }>
 export const refreshTemplates = (channel: string): Promise<{ channel: string; count: number }> =>
   request("/api/templates/refresh", { method: "POST", body: JSON.stringify({ channel }) });
 
+/**
+ * Submit new body text for a template. This writes to the PROVIDER — the
+ * template goes back into review and leaves the send picker until approved.
+ * `variables_changed` reports the edit that breaks existing automations.
+ */
+export const editTemplate = (
+  id: string,
+  bodyText: string,
+  /** One per {{n}}. Omit to keep the samples already on the template. */
+  samples?: string[],
+): Promise<{
+  template: Template;
+  variables_changed: boolean;
+  variables_before: string[];
+  variables_after: string[];
+}> =>
+  request(`/api/templates/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(samples ? { bodyText, samples } : { bodyText }),
+  });
+
+/**
+ * Create a template at the provider. It arrives here PENDING and is not
+ * sendable until the provider approves it. Every {{n}} needs a sample value —
+ * the provider cannot categorise a template with variables and no examples.
+ */
+export const createTemplate = (input: {
+  channel?: string;
+  name: string;
+  language: string;
+  category: string;
+  bodyText: string;
+  samples: string[];
+}): Promise<Template> =>
+  request("/api/templates", { method: "POST", body: JSON.stringify(input) });
+
+/**
+ * Delete a template at the provider. Not reversible, and the provider blocks
+ * re-use of the name for 30 days — an edit is the way to fix copy.
+ */
+export const deleteTemplate = (
+  id: string,
+): Promise<{ deleted: string; name: string; language: string }> =>
+  request(`/api/templates/${id}`, { method: "DELETE" });
+
 export function listTemplates(params: {
   channel?: string;
   search?: string;
   limit?: number;
+  /** "all" to include templates in review — the composer wants APPROVED only
+   *  (the server default), the management screen wants everything. */
+  status?: string;
 }): Promise<{ items: Template[]; total: number }> {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {

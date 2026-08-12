@@ -67,6 +67,10 @@ const TemplateSchema = z
     status: z.string(),
     bodyText: z.string(),
     variables: z.array(z.string()),
+    /** The provider's own component array (header/body/footer/buttons). The
+     *  editor needs it to show what it is NOT editing, and an edit has to send
+     *  back the parts it is preserving. */
+    components: z.array(z.unknown()),
     syncedAt: z.string(),
   })
   .openapi("Template");
@@ -233,9 +237,10 @@ type ProviderTemplate = {
  * takes freeform and has nothing to list.
  */
 /**
- * Composio caps `limit` at 100, but a full page is slow enough that the broker
- * hop times out (522). Smaller pages return inside the budget; pagination below
- * still walks the whole catalogue, so this costs round trips, not coverage.
+ * Deliberately well under the provider's own page cap: a full page is slow
+ * enough to time out upstream, while smaller pages return comfortably.
+ * Pagination below still walks the whole catalogue, so this costs round trips,
+ * not coverage.
  */
 const PROVIDER_PAGE = 25;
 /** Backstop so a paging bug can't spin forever: 25 × 40 = 1000 templates. */
@@ -265,15 +270,14 @@ const TEMPLATE_SOURCES: Record<string, (env: Env["Bindings"]) => Promise<Provide
 
 /**
  * Pull one page out of Meta's `{ data: [...], paging: { cursors: { after } } }`,
- * however deep the broker nests it under its own `data` envelope. Written
- * defensively on purpose: the shape belongs to two vendors, and a silent change
- * should yield an empty catalogue, never a crash.
+ * however deeply it arrives nested under `data` envelopes. Written defensively
+ * on purpose: the shape is not ours, and a silent change should yield an empty
+ * catalogue, never a crash.
  */
 /**
- * Descend through the broker's `data` envelopes to Meta's own
- * `{ data: [...], paging }` node. Shared by every Meta reader here, and written
- * defensively: the shape belongs to two vendors, so an unexpected one should
- * yield nothing rather than throw.
+ * Descend through any `data` envelopes to Meta's own `{ data: [...], paging }`
+ * node. Shared by every Meta reader here, and written defensively: the shape is
+ * not ours, so an unexpected one should yield nothing rather than throw.
  */
 function unwrapMetaRows(result: unknown): {
   rows: Record<string, unknown>[];
@@ -414,6 +418,14 @@ const toTemplate = (t: typeof schema.templates.$inferSelect) => ({
   status: t.status,
   bodyText: t.bodyText,
   variables: JSON.parse(t.variables) as string[],
+  components: ((): unknown[] => {
+    try {
+      const p = JSON.parse(t.components) as unknown;
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  })(),
   syncedAt: t.syncedAt,
 });
 
@@ -1509,6 +1521,528 @@ api.openapi(
   },
 );
 
+/* ------------------------ writing a template to Meta ----------------------- */
+
+/**
+ * Creating a template and editing one are two different calls to Meta, and only
+ * one of them has an action behind it.
+ *
+ *   - **Create** is `WHATSAPP_CREATE_MESSAGE_TEMPLATE`. It works, and it takes
+ *     `allow_category_change` so Meta's own read of the copy wins.
+ *   - **Edit** has no action at all. WhatsApp publishes 57 of them and none
+ *     edits a template. `WHATSAPP_UPSERT_MESSAGE_TEMPLATE` looks like the one
+ *     and is bound to Meta's `upsert_message_templates`, the AUTHENTICATION
+ *     endpoint — which is why it answers `Param category must be one of
+ *     {AUTHENTICATION}` and `Unexpected key "text"`, neither of which reads
+ *     like "wrong endpoint". No arrangement of arguments makes it edit
+ *     marketing copy.
+ *
+ * So the edit goes out as a raw request to Meta's real edit endpoint,
+ * `POST /{template_id}`, signed with the org's own connection —
+ * `connect(...).rawRequest` in `@clawnify/connections`, for the case an action
+ * catalogue does not cover. Talking to Meta directly also means Meta's
+ * documented shapes apply: `example.body_text` nested as an array of example
+ * sets, exactly as the catalogue returns it.
+ *
+ * The samples are never optional. A body with variables and no examples is one
+ * Meta can only categorise as AUTHENTICATION, and the write is refused.
+ */
+const TEMPLATE_CREATE_ACTION = "WHATSAPP_CREATE_MESSAGE_TEMPLATE";
+
+/**
+ * The provider's own complaint, recovered from whatever the SDK threw.
+ *
+ * `run()` throws `new Error(r.error)` on failure, and that error is sometimes an
+ * object, which stringifies to the useless "[object Object]" — precisely when
+ * the detail matters most. An uncaught rejection here would surface as a bare
+ * 500, and the provider's complaint (wrong category, malformed component,
+ * missing sample) is the only thing that tells the person editing what to fix.
+ */
+function providerError(e: unknown): string {
+  const raw = (e as { message?: unknown })?.message ?? e;
+  if (typeof raw === "string" && raw !== "[object Object]") return raw.slice(0, 500);
+  try {
+    return JSON.stringify(raw).slice(0, 500);
+  } catch {
+    return String(raw).slice(0, 500);
+  }
+}
+
+/**
+ * Meta's `example` block for a body, in the shape that matches its placeholders.
+ *
+ * Positional (`{{1}}`) and named (`{{first_name}}`) templates take different
+ * keys, and sending the wrong one is rejected as a malformed component.
+ */
+function bodyExample(
+  placeholders: string[],
+  samples: string[],
+): Record<string, unknown> | undefined {
+  if (placeholders.length === 0) return undefined;
+  const positional = placeholders.every((p) => /^\d+$/.test(p));
+  return positional
+    ? // An array of example SETS, not an array of values — one set here.
+      { body_text: [samples] }
+    : {
+        body_text_named_params: placeholders.map((p, i) => ({
+          param_name: p,
+          example: samples[i] ?? "",
+        })),
+      };
+}
+
+/** The samples already on a stored template, whichever shape they arrived in. */
+function samplesOf(components: unknown[]): string[] {
+  for (const comp of components) {
+    const c = comp as { type?: string; example?: Record<string, unknown> };
+    if (c?.type?.toUpperCase() !== "BODY" || !c.example) continue;
+    const positional = c.example.body_text;
+    if (Array.isArray(positional)) {
+      // `[["Lexie", "a nut allergy"]]` — take the first set. A flat array is
+      // not a shape Meta returns, but costs one line to survive.
+      const first = positional[0];
+      return Array.isArray(first) ? first.map(String) : positional.map(String);
+    }
+    const named = c.example.body_text_named_params;
+    if (Array.isArray(named)) {
+      return named.map((p) => String((p as { example?: unknown })?.example ?? ""));
+    }
+  }
+  return [];
+}
+
+/**
+ * The components array as the WRITE side accepts it — not as the read side
+ * returned it. Meta hands back fields the write rejects, so each component is
+ * rebuilt from the keys the action declares rather than echoed back.
+ *
+ * Only BODY text is ours to change. Headers, footers and buttons carry through
+ * untouched: they are a different editing problem (media, URLs, quick replies)
+ * and pretending otherwise in a plain text box loses them.
+ */
+function componentsForWrite(
+  stored: unknown[],
+  bodyText: string,
+  example: Record<string, unknown> | undefined,
+): Record<string, unknown>[] {
+  const carried = stored.map((comp) => {
+    const c = comp as Record<string, unknown>;
+    const out: Record<string, unknown> = { type: c.type };
+    if (typeof c.text === "string") out.text = c.text;
+    if (typeof c.format === "string") out.format = c.format;
+    if (Array.isArray(c.buttons)) out.buttons = c.buttons;
+    if (c.example && (c.type as string)?.toUpperCase() !== "BODY") out.example = c.example;
+    return out;
+  });
+
+  const body: Record<string, unknown> = { type: "BODY", text: bodyText };
+  if (example) body.example = example;
+
+  const hasBody = carried.some((c) => (c.type as string)?.toUpperCase() === "BODY");
+  return hasBody
+    ? carried.map((c) => ((c.type as string)?.toUpperCase() === "BODY" ? body : c))
+    : [...carried, body];
+}
+
+/** Meta's name rule, checked here so a typo fails before a round trip. */
+const TEMPLATE_NAME = z
+  .string()
+  .min(1)
+  .max(512)
+  .regex(/^[a-z0-9_]+$/, "lowercase letters, digits and underscores only");
+
+const CATEGORIES = ["AUTHENTICATION", "MARKETING", "UTILITY"] as const;
+
+/**
+ * Create a template at the provider.
+ *
+ * It is created THERE and mirrored here, same as every other row — the local
+ * row exists so the catalogue is complete without a resync, and starts at
+ * PENDING because a new template is never immediately sendable.
+ *
+ * `allow_category_change` is sent because Meta re-derives the category from the
+ * copy and refuses the write when its verdict differs from ours. On a new
+ * template letting Meta's verdict win is strictly better than bouncing the
+ * person back to guess again; on an EDIT it cannot help, because Meta will not
+ * move an existing template between categories at all.
+ */
+api.openapi(
+  createRoute({
+    method: "post",
+    path: "/api/templates",
+    summary: "Create a template at the provider",
+    description:
+      "Submits a new template to the channel's provider and mirrors it here as PENDING. Every {{n}} in the body needs a sample value — a template with variables and no samples can only be categorised AUTHENTICATION, and the provider rejects it. The template is not sendable until the provider approves it.",
+    request: {
+      body: jsonBody(
+        z
+          .object({
+            channel: z.enum(CHANNELS).default("whatsapp"),
+            name: TEMPLATE_NAME,
+            /** Meta's own code, e.g. "en_US" or "en" — not normalised here. */
+            language: z.string().min(2).max(10),
+            category: z.enum(CATEGORIES),
+            bodyText: z.string().min(1).max(1024),
+            /** One per {{n}} in bodyText, in order of first appearance. */
+            samples: z.array(z.string()).default([]),
+          })
+          .openapi("TemplateCreate"),
+      ),
+    },
+    responses: {
+      200: jsonRes(TemplateSchema, "Submitted to the provider; awaiting review"),
+      400: jsonRes(ErrorSchema, "A sample is missing for a variable in the body"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      409: jsonRes(ErrorSchema, "That name and language already exist"),
+      424: jsonRes(ErrorSchema, "The provider rejected the template"),
+      501: jsonRes(ErrorSchema, "Channel has no templates to create"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const input = c.req.valid("json");
+    if (input.channel !== "whatsapp") {
+      return c.json({ error: `${input.channel} has no templates to create` }, 501);
+    }
+    const db = dbFor(c.env);
+
+    const variables = placeholdersIn(input.bodyText);
+    if (variables.length !== input.samples.length) {
+      return c.json(
+        {
+          error: `the body has ${variables.length} variable(s) (${variables
+            .map((v) => `{{${v}}}`)
+            .join(" ")}) and ${input.samples.length} sample(s) — the provider needs one example value per variable`,
+        },
+        400,
+      );
+    }
+
+    const [clash] = await db
+      .select({ id: schema.templates.id })
+      .from(schema.templates)
+      .where(
+        and(
+          eq(schema.templates.orgId, org),
+          eq(schema.templates.channel, input.channel),
+          eq(schema.templates.name, input.name),
+          eq(schema.templates.language, input.language),
+        ),
+      )
+      .limit(1);
+    if (clash) {
+      return c.json(
+        { error: `"${input.name}" already exists in ${input.language} — edit that one instead` },
+        409,
+      );
+    }
+
+    const components = componentsForWrite(
+      [],
+      input.bodyText,
+      bodyExample(variables, input.samples),
+    );
+
+    // What Meta answers a create with: the new template's id, and the status
+    // and category it decided on.
+    type CreatedTemplate = { id?: unknown; status?: unknown; category?: unknown };
+    let created: CreatedTemplate | null = null;
+    try {
+      created = (await connect("whatsapp", c.env as never).run(TEMPLATE_CREATE_ACTION, {
+        name: input.name,
+        language: input.language,
+        category: input.category,
+        components,
+        allow_category_change: true,
+      })) as CreatedTemplate | null;
+    } catch (e) {
+      return c.json({ error: providerError(e) }, 424);
+    }
+
+    // Meta's answer arrives either bare or wrapped in a `data` envelope, the
+    // same as every read here. One unwrap, then read it either way.
+    const answer: CreatedTemplate =
+      created && typeof (created as { data?: unknown }).data === "object"
+        ? ((created as { data: CreatedTemplate }).data ?? {})
+        : (created ?? {});
+
+    const [row] = await db
+      .insert(schema.templates)
+      .values({
+        orgId: org,
+        channel: input.channel,
+        name: input.name,
+        language: input.language,
+        // Meta answers with the category it actually assigned, which is the
+        // point of allow_category_change — store its verdict, not our request.
+        category: typeof answer.category === "string" ? answer.category : input.category,
+        status: typeof answer.status === "string" ? answer.status.toUpperCase() : "PENDING",
+        bodyText: input.bodyText,
+        variables: JSON.stringify(variables),
+        components: JSON.stringify(components),
+        externalId: typeof answer.id === "string" ? answer.id : null,
+      })
+      .returning();
+
+    return c.json(toTemplate(row), 200);
+  },
+);
+
+/**
+ * Edit a template's body text, at the provider.
+ *
+ * This is a WRITE TO META, not a local edit. The catalogue here is a mirror —
+ * changing a row would only be overwritten by the next sync, and would send
+ * copy the provider never approved.
+ *
+ * Three consequences the UI has to be honest about, because all three surprised
+ * us when they happened by hand:
+ *
+ *   1. **It goes back into review.** Meta re-reviews a template on every edit,
+ *      so an approved template becomes PENDING the moment you save. We set that
+ *      locally straight away rather than leaving the row saying APPROVED until
+ *      the next sync — the picker must not offer copy that will bounce.
+ *
+ *   2. **Changing the number of `{{n}}` placeholders breaks every automation
+ *      that sends it.** The provider rejects a send whose variable count does
+ *      not match, so anything scheduled against this template starts failing
+ *      silently. Callers get `variables_changed` back so they can say so;
+ *      whether that is a warning or a block belongs to whoever knows what
+ *      consumes the template, which is not this app.
+ *
+ *   3. **The category cannot move.** Meta refuses an edit whose category
+ *      differs from the one already on the template ("The category UTILITY
+ *      doesn't match the one that's already associated with this template,
+ *      MARKETING"), so the stored category is sent back verbatim and is not an
+ *      editable field here.
+ *
+ * Samples ride along with every edit: the write carries the whole component, so
+ * omitting them would strip the examples off an approved template and leave it
+ * uncategorisable. Existing samples are reused when the variable count is
+ * unchanged; when it changes, the caller has to supply new ones.
+ */
+api.openapi(
+  createRoute({
+    method: "patch",
+    path: "/api/templates/:id",
+    summary: "Edit a template's body text at the provider",
+    description:
+      "Submits new body text to the channel's provider and marks the local row as awaiting review. The template leaves the send picker until the provider approves it again — that is the provider's rule, not ours. Returns `variables_changed: true` when the edit alters the {{n}} placeholders, which is the change that breaks automations already sending this template. Supply `samples` when the edit changes how many variables the body has; otherwise the samples already on the template are reused.",
+    request: {
+      params: IdParam,
+      body: jsonBody(
+        z
+          .object({
+            bodyText: z.string().min(1).max(1024),
+            /** One per {{n}}. Omit to keep the template's current samples. */
+            samples: z.array(z.string()).optional(),
+          })
+          .openapi("TemplateEdit"),
+      ),
+    },
+    responses: {
+      200: jsonRes(
+        z
+          .object({
+            template: TemplateSchema,
+            variables_changed: z.boolean(),
+            variables_before: z.array(z.string()),
+            variables_after: z.array(z.string()),
+          })
+          .openapi("TemplateEditResult"),
+        "Submitted to the provider; awaiting review",
+      ),
+      400: jsonRes(ErrorSchema, "A sample is missing for a variable in the body"),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      404: jsonRes(ErrorSchema, "No such template"),
+      409: jsonRes(ErrorSchema, "The row has no provider id — sync, then edit"),
+      424: jsonRes(ErrorSchema, "The provider rejected the edit"),
+      501: jsonRes(ErrorSchema, "Channel has no editable templates"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const { id } = c.req.valid("param");
+    const { bodyText, samples } = c.req.valid("json");
+    const db = dbFor(c.env);
+
+    const [row] = await db
+      .select()
+      .from(schema.templates)
+      .where(and(eq(schema.templates.orgId, org), eq(schema.templates.id, id)))
+      .limit(1);
+    if (!row) return c.json({ error: "not found" }, 404);
+    if (row.channel !== "whatsapp") {
+      return c.json({ error: `${row.channel} templates are not editable here` }, 501);
+    }
+
+    const before = placeholdersIn(row.bodyText);
+    const after = placeholdersIn(bodyText);
+
+    // Carry every other component through unchanged; swap only BODY's text.
+    let stored: unknown[];
+    try {
+      const parsed = JSON.parse(row.components) as unknown[];
+      stored = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      stored = [];
+    }
+
+    // Reuse what is already on the template unless the caller sent new samples.
+    // The write replaces the whole BODY component, so samples that are not sent
+    // are samples REMOVED — and a template with variables and no samples is one
+    // Meta will only accept as AUTHENTICATION.
+    const values = samples ?? samplesOf(stored);
+    if (values.length !== after.length) {
+      return c.json(
+        {
+          error: `this edit leaves ${after.length} variable(s) (${after
+            .map((v) => `{{${v}}}`)
+            .join(" ")}) but ${values.length} sample(s) — send one example value per variable`,
+        },
+        400,
+      );
+    }
+
+    // Meta addresses an edit by template id, not by name + language, so a row
+    // we never learned an id for cannot be edited — and guessing by name would
+    // edit whichever language variant Meta picked.
+    if (!row.externalId) {
+      return c.json(
+        { error: `"${row.name}" has no provider id here — sync from the provider first` },
+        409,
+      );
+    }
+
+    const components = componentsForWrite(stored, bodyText, bodyExample(after, values));
+    try {
+      // Meta's own edit endpoint, reached with the org's connection. `category`
+      // is deliberately absent: an edit that names one is refused when Meta's
+      // verdict differs ("The category UTILITY doesn't match the one that's
+      // already associated with this template, MARKETING"), and omitting it
+      // leaves the template exactly where it was — which is what an edit to
+      // the copy should do.
+      await connect("whatsapp", c.env as never).rawRequest({
+        method: "POST",
+        endpoint: `/${row.externalId}`,
+        body: { components },
+      });
+    } catch (e) {
+      return c.json({ error: providerError(e) }, 424);
+    }
+
+    const [updated] = await db
+      .update(schema.templates)
+      .set({
+        bodyText,
+        variables: JSON.stringify(after),
+        components: JSON.stringify(components),
+        // Its own truth until the next sync: an edited template is in review,
+        // and the picker filters on APPROVED.
+        status: "PENDING",
+        syncedAt: new Date().toISOString(),
+      })
+      .where(and(eq(schema.templates.orgId, org), eq(schema.templates.id, id)))
+      .returning();
+
+    return c.json(
+      {
+        template: toTemplate(updated),
+        variables_changed: before.length !== after.length,
+        variables_before: before,
+        variables_after: after,
+      },
+      200,
+    );
+  },
+);
+
+/**
+ * Delete a template at the provider, and stop mirroring it here.
+ *
+ * Two properties of the provider's delete make this more than a DELETE row:
+ *
+ *   1. **It is not reversible, and the name is burned.** Meta blocks re-use of
+ *      a deleted template's name for 30 days, so "delete and recreate to fix a
+ *      typo" is a month without that template. Editing is the repair; deleting
+ *      is for copy that should stop existing.
+ *
+ *   2. **Deleting by name deletes every language.** Meta's delete takes a name
+ *      and removes all of its language variants unless `hsm_id` narrows it to
+ *      one. We always narrow, and refuse when we cannot: a row with no provider
+ *      id came from somewhere we cannot pin down, and taking out an unrelated
+ *      language because of that is not a mistake this app gets to make.
+ */
+api.openapi(
+  createRoute({
+    method: "delete",
+    path: "/api/templates/:id",
+    summary: "Delete a template at the provider",
+    description:
+      "Deletes this template's language variant at the provider and removes the mirrored row. Not reversible: the provider blocks re-use of the name for 30 days, so use an edit to fix copy and a delete only to retire it.",
+    request: { params: IdParam },
+    responses: {
+      200: jsonRes(
+        z
+          .object({ deleted: z.string(), name: z.string(), language: z.string() })
+          .openapi("TemplateDeleted"),
+        "Deleted at the provider and here",
+      ),
+      401: jsonRes(ErrorSchema, "No org identity"),
+      404: jsonRes(ErrorSchema, "No such template"),
+      409: jsonRes(ErrorSchema, "The row has no provider id — sync, then delete"),
+      424: jsonRes(ErrorSchema, "The provider refused the delete"),
+      501: jsonRes(ErrorSchema, "Channel has no deletable templates"),
+    },
+  }),
+  async (c) => {
+    const org = orgId(c);
+    if (!org) return c.json({ error: "unauthorized" }, 401);
+    const { id } = c.req.valid("param");
+    const db = dbFor(c.env);
+
+    const [row] = await db
+      .select()
+      .from(schema.templates)
+      .where(and(eq(schema.templates.orgId, org), eq(schema.templates.id, id)))
+      .limit(1);
+    if (!row) return c.json({ error: "not found" }, 404);
+    if (row.channel !== "whatsapp") {
+      return c.json({ error: `${row.channel} templates are not deletable here` }, 501);
+    }
+    if (!row.externalId) {
+      return c.json(
+        {
+          error: `"${row.name}" has no provider id here, and deleting by name alone would take every language variant with it — sync from the provider first`,
+        },
+        409,
+      );
+    }
+
+    try {
+      await connect("whatsapp", c.env as never).run("WHATSAPP_DELETE_MESSAGE_TEMPLATE", {
+        name: row.name,
+        // Narrows the delete to this one language variant. Without it Meta
+        // deletes every language sharing the name.
+        hsm_id: row.externalId,
+      });
+    } catch (e) {
+      return c.json({ error: providerError(e) }, 424);
+    }
+
+    // Only after the provider agreed. Dropping the row first would hide a
+    // template that is still live and still sendable by anything holding its
+    // name.
+    await db
+      .delete(schema.templates)
+      .where(and(eq(schema.templates.orgId, org), eq(schema.templates.id, id)));
+
+    return c.json({ deleted: id, name: row.name, language: row.language }, 200);
+  },
+);
+
 /* --------------------------------- sending -------------------------------- */
 
 /**
@@ -1879,8 +2413,8 @@ api.openapi(
 );
 
 /**
- * Map Meta's phone-number rows, tolerating the broker's nesting. Knows nothing
- * about defaults — that's this app's state, not the provider's.
+ * Map Meta's phone-number rows, tolerating however they arrive nested. Knows
+ * nothing about defaults — that's this app's state, not the provider's.
  */
 type ProviderPhone = Omit<z.infer<typeof PhoneSchema>, "isDefault">;
 
