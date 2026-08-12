@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, RefreshCw, TriangleAlert } from "lucide-react";
 import type { Phone } from "./api";
 import { listPhones, registerPhone, setDefaultPhone } from "./api";
+import { TemplatesPanel } from "./templates";
 import { Eyebrow } from "./ui";
 
 /**
@@ -104,6 +105,12 @@ export function WhatsAppSetup() {
             straight to Meta and never stored here — keep your own record of it, because Meta asks
             for it again on any re-registration or number migration.
           </p>
+
+          {/* Templates are WhatsApp's, not the inbox's — same page as the
+              numbers that send them. */}
+          <div className="mt-10 border-t border-border pt-6">
+            <TemplatesPanel />
+          </div>
         </div>
       </div>
 

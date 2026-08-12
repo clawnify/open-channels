@@ -109,13 +109,13 @@ export const settings = sqliteTable(
 );
 
 /**
- * Approved channel message templates, mirrored in by the agent.
+ * The channel's message templates, mirrored from the provider.
  *
  * WhatsApp Business only lets you open a conversation (or re-engage one whose
  * 24-hour customer service window has lapsed) with a template Meta has
- * approved. The app never calls Meta — the agent syncs the catalogue in via
- * POST /api/templates/sync, exactly as it mirrors messages, so switching
- * provider (Cloud API, Composio, Bird) never touches this app.
+ * approved. This table is a mirror, never the source of truth: the provider
+ * owns the catalogue, `POST /api/templates/refresh` re-reads it, and every
+ * create/edit/delete is written THERE and re-read from there.
  */
 export const templates = sqliteTable(
   "templates",
