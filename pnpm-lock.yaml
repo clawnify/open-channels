@@ -12,8 +12,8 @@ importers:
         specifier: ^0.1.1
         version: 0.1.1(@cloudflare/workers-types@5.20260804.1)(@hono/zod-openapi@0.19.10(hono@4.13.0)(zod@3.25.76))(hono@4.13.0)
       '@clawnify/connections':
-        specifier: ^0.3.0
-        version: 0.3.0
+        specifier: ^0.4.0
+        version: 0.4.0
       '@clawnify/db':
         specifier: ^0.4.1
         version: 0.4.1(@cloudflare/workers-types@5.20260804.1)
@@ -172,14 +172,14 @@ packages:
       '@hono/zod-openapi': '>=0.18 <1'
       hono: '*'
 
-  '@clawnify/connections@0.3.0':
-    resolution: {integrity: sha512-HYhqTirgLP9D7A89ODUetdhpiKIbJnozy4nrtTxWbTdrbejCF4ch3U8PVxnqF4SfijfBEn60axWTSGp8fMtZeQ==}
+  '@clawnify/connections@0.4.0':
+    resolution: {integrity: sha512-aRVA8Y/MxIUfb+l4/WyUZ1sPcPN5EtVWe5j4eWzcnalRyGVBChPVEQuPjM39U38bRlsbKEYuMVUmYbhrig0XjA==}
 
   '@clawnify/db@0.4.1':
     resolution: {integrity: sha512-Ck9RGqEElt6P/3S9quxvr2MIg8mZk1n9wFftH3PpGPFnpA6hbk0td67oaioeMRuDCn7vePcJCeyYEkbvNVYy/g==}
 
-  '@clawnify/integrations@0.2.2':
-    resolution: {integrity: sha512-st7m8+zszpskeaj599kepIz8LSX0ASTkJThJ7gNGuOG7Ra9sn3ui+1P9kkKo8opYOXGOnLxYpAX2n8zRKkY26w==}
+  '@clawnify/integrations@0.3.0':
+    resolution: {integrity: sha512-7sGiAADJYGiWwuCp1oQjM8iGdpjn34o2MNYXjhiTWQ1VoTP+CTU3nE7GxgIuJ8nxxmblPg5TDGItq2Jidru4kg==}
 
   '@clawnify/logokit@0.3.0':
     resolution: {integrity: sha512-zl1Km86CoX6FeZTFOWPiarxDOn8OKNwMUklMhrBql9Xj/nPp2CEtlF+p7uptvacqnNO+jrXLJvoB4PqKi+5TXQ==}
@@ -2368,9 +2368,9 @@ snapshots:
       - sql.js
       - sqlite3
 
-  '@clawnify/connections@0.3.0':
+  '@clawnify/connections@0.4.0':
     dependencies:
-      '@clawnify/integrations': 0.2.2
+      '@clawnify/integrations': 0.3.0
 
   '@clawnify/db@0.4.1(@cloudflare/workers-types@5.20260804.1)':
     dependencies:
@@ -2406,7 +2406,7 @@ snapshots:
       - sql.js
       - sqlite3
 
-  '@clawnify/integrations@0.2.2': {}
+  '@clawnify/integrations@0.3.0': {}
 
   '@clawnify/logokit@0.3.0': {}
 
