@@ -11,6 +11,7 @@ import {
 import type { Conversation, Message, Phone } from "./api";
 import { addComment, contactLabel, getMessages, listPhones, patchConversation, sendReply } from "./api";
 import { TemplateComposer } from "./compose";
+import { EmojiPicker } from "./emoji";
 import { Avatar, ChannelChip, channelMeta, timeOfDay } from "./ui";
 
 const POLL_MS = 4000;
@@ -111,6 +112,27 @@ export function ThreadPane({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const draftRef = useRef<HTMLTextAreaElement>(null);
+
+  /**
+   * Drop an emoji where the caret is, not at the end — people add one mid
+   * sentence as often as they finish with one. Selected text is replaced, which
+   * is what every other editor does.
+   */
+  const insertEmoji = (emoji: string) => {
+    const el = draftRef.current;
+    const from = el ? el.selectionStart : draft.length;
+    const to = el ? el.selectionEnd : draft.length;
+    setDraft(draft.slice(0, from) + emoji + draft.slice(to));
+    // The new value only reaches the DOM on the next render, so the caret can
+    // only be placed after it — otherwise it snaps back to the end.
+    requestAnimationFrame(() => {
+      const node = draftRef.current;
+      if (!node) return;
+      node.focus();
+      node.setSelectionRange(from + emoji.length, from + emoji.length);
+    });
+  };
   /** Registered numbers we can send from — only relevant on WhatsApp. */
   const [phones, setPhones] = useState<Phone[]>([]);
   const [fromId, setFromId] = useState<string | null>(null);
@@ -330,6 +352,7 @@ export function ThreadPane({
           ) : (
             <>
               <textarea
+                ref={draftRef}
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => {
@@ -352,7 +375,8 @@ export function ThreadPane({
                   {error}
                 </p>
               ) : null}
-              <div className="flex items-center justify-end px-3 pb-2.5">
+              <div className="flex items-center justify-between px-3 pb-2.5">
+                <EmojiPicker onPick={insertEmoji} />
                 {mode === "reply" ? (
                   <button
                     type="button"
