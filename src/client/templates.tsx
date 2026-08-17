@@ -265,6 +265,23 @@ const CATEGORIES = [
 ] as const;
 
 /**
+ * The category the provider assigned, on every row. Neutral tone on purpose:
+ * unlike status, no category is a problem state — but which one a template
+ * landed in decides its pricing and delivery rules, so it must be visible
+ * without opening the editor.
+ */
+function CategoryPill({ category }: { category: string }) {
+  return (
+    <span
+      className="shrink-0 rounded-full border border-border bg-sunken px-2 py-0.5 text-[0.6875rem] font-medium text-muted"
+      title={CATEGORIES.find((c) => c.value === category)?.hint ?? category}
+    >
+      {category}
+    </span>
+  );
+}
+
+/**
  * Create a template.
  *
  * The name and language are permanent: the provider keys the template on them,
@@ -498,6 +515,7 @@ export function TemplatesPanel() {
                     <div className="flex items-center gap-2">
                       <span className="truncate font-mono text-[0.8125rem] font-medium">{t.name}</span>
                       <StatusPill status={t.status} />
+                      <CategoryPill category={t.category} />
                       {justSaved === t.id && (
                         <span className="inline-flex items-center gap-1 text-[0.6875rem] text-emerald-700">
                           <Check className="size-3" aria-hidden /> submitted
