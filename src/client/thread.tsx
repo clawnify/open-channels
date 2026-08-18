@@ -3,6 +3,7 @@ import {
   Archive,
   Bot,
   CheckCheck,
+  ChevronLeft,
   FileText,
   RotateCcw,
   StickyNote,
@@ -49,7 +50,7 @@ function OutboundStatus({ message }: { message: Message }) {
 function MessageRow({ message }: { message: Message }) {
   if (message.kind === "system") {
     return (
-      <div className="flex items-center justify-center gap-1.5 px-6 text-[0.6875rem] leading-relaxed text-muted">
+      <div className="flex items-center justify-center gap-1.5 px-4 text-[0.6875rem] leading-relaxed text-muted md:px-6">
         <Bot className="size-3 shrink-0" aria-hidden />
         <span>
           {message.body} · {timeOfDay(message.createdAt)}
@@ -60,7 +61,7 @@ function MessageRow({ message }: { message: Message }) {
 
   if (message.kind === "comment") {
     return (
-      <div className="mx-6 rounded-lg border border-warning/25 bg-warning-tint px-3.5 py-2.5">
+      <div className="mx-4 rounded-lg border border-warning/25 bg-warning-tint px-3.5 py-2.5 md:mx-6">
         <div className="mb-1 flex items-center gap-1.5 text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-warning">
           <StickyNote className="size-3" aria-hidden />
           Internal note · {message.authorName ?? "Someone"}
@@ -72,8 +73,8 @@ function MessageRow({ message }: { message: Message }) {
 
   const outbound = message.kind === "outbound";
   return (
-    <div className={`flex px-6 ${outbound ? "justify-end" : "justify-start"}`}>
-      <div className={`max-w-[70%] ${outbound ? "items-end" : "items-start"} flex flex-col gap-1`}>
+    <div className={`flex px-4 md:px-6 ${outbound ? "justify-end" : "justify-start"}`}>
+      <div className={`max-w-[85%] md:max-w-[70%] ${outbound ? "items-end" : "items-start"} flex flex-col gap-1`}>
         <div
           className={
             outbound
@@ -102,9 +103,12 @@ function MessageRow({ message }: { message: Message }) {
 export function ThreadPane({
   conversation,
   onConversationChanged,
+  onBack,
 }: {
   conversation: Conversation;
   onConversationChanged: () => void;
+  /** Phones show one pane at a time — this returns to the conversation list. */
+  onBack?: () => void;
 }) {
   const [messages, setMessages] = useState<Message[] | null>(null);
   const [mode, setMode] = useState<"reply" | "note">("reply");
@@ -210,7 +214,17 @@ export function ThreadPane({
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background">
       {/* Toolbar */}
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-5">
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-4 md:px-5">
+        {onBack ? (
+          <button
+            type="button"
+            onClick={onBack}
+            aria-label="Back to conversation list"
+            className="-ml-2 -mr-1 inline-flex size-8 shrink-0 items-center justify-center rounded-sm text-muted transition-colors duration-150 hover:bg-sunken hover:text-foreground md:hidden"
+          >
+            <ChevronLeft className="size-5" aria-hidden />
+          </button>
+        ) : null}
         <Avatar contact={contact} size={8} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -255,9 +269,9 @@ export function ThreadPane({
       </div>
 
       {/* Composer */}
-      <footer className="shrink-0 border-t border-border p-4">
+      <footer className="shrink-0 border-t border-border p-3 md:p-4">
         <div className="rounded-lg border border-border bg-surface">
-          <div className="flex items-center justify-between border-b border-border px-3 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-border px-3 py-2">
             <div className="flex rounded-lg bg-sunken p-0.5" role="tablist" aria-label="Compose mode">
               {(["reply", "note"] as const).map((m) => (
                 <button

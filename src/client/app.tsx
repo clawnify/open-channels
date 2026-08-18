@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Archive, Inbox, PenLine, Search, Settings } from "lucide-react";
+import { Archive, Inbox, Menu, PenLine, Search, Settings } from "lucide-react";
 import type { Conversation, Stats } from "./api";
 import { contactLabel, getStats, listConversations, patchConversation } from "./api";
 import { NewConversationDialog } from "./compose";
@@ -148,6 +148,20 @@ function Sidebar({
   );
 }
 
+/** Opens the sidebar drawer on screens too narrow to keep it in view. */
+function MenuButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Open inbox filters"
+      className="-ml-1 inline-flex size-8 shrink-0 items-center justify-center rounded-sm text-muted transition-colors duration-150 hover:bg-sunken hover:text-foreground lg:hidden"
+    >
+      <Menu className="size-4" aria-hidden />
+    </button>
+  );
+}
+
 function ConversationRow({
   conversation,
   active,
@@ -205,6 +219,8 @@ export function App() {
   const [total, setTotal] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
+  /** Sidebar drawer on narrow screens (below lg the sidebar leaves the flow). */
+  const [drawer, setDrawer] = useState(false);
   /** A just-opened thread, so it renders before the list has refetched. */
   const [pending, setPending] = useState<Conversation | null>(null);
   const searchDebounce = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -276,11 +292,33 @@ export function App() {
     }
   }
 
+  /** Filter changes made from the drawer also dismiss it. */
+  function navigate(f: Filter) {
+    setFilter(f);
+    setDrawer(false);
+  }
+
+  const sidebarDrawer = drawer ? (
+    <div className="fixed inset-0 z-40 lg:hidden">
+      <div
+        className="absolute inset-0 bg-foreground/25"
+        onMouseDown={() => setDrawer(false)}
+        aria-hidden
+      />
+      <div className="absolute inset-y-0 left-0 flex shadow-[0_8px_24px_rgba(0,0,0,0.16)]">
+        <Sidebar stats={stats} filter={filter} setFilter={navigate} />
+      </div>
+    </div>
+  ) : null;
+
   if (filter.kind === "setup") {
     return (
       <div className="flex h-full bg-background font-sans text-foreground">
-        <Sidebar stats={stats} filter={filter} setFilter={setFilter} />
-        <WhatsAppSetup />
+        <div className="hidden shrink-0 lg:flex">
+          <Sidebar stats={stats} filter={filter} setFilter={setFilter} />
+        </div>
+        <WhatsAppSetup menu={<MenuButton onClick={() => setDrawer(true)} />} />
+        {sidebarDrawer}
       </div>
     );
   }
@@ -294,14 +332,21 @@ export function App() {
 
   return (
     <div className="flex h-full bg-background font-sans text-foreground">
-      <Sidebar stats={stats} filter={filter} setFilter={setFilter} />
+      <div className="hidden shrink-0 lg:flex">
+        <Sidebar stats={stats} filter={filter} setFilter={setFilter} />
+      </div>
 
-      {/* Conversation list */}
-      <section className="flex w-[22rem] shrink-0 flex-col border-r border-border bg-surface">
+      {/* Conversation list — on phones it swaps out for the open thread. */}
+      <section
+        className={`${selected ? "hidden md:flex" : "flex"} w-full min-w-0 shrink-0 flex-col border-r border-border bg-surface md:w-[22rem]`}
+      >
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-          <Eyebrow>
-            {listTitle} · {total}
-          </Eyebrow>
+          <div className="flex min-w-0 flex-1 items-center gap-1.5">
+            <MenuButton onClick={() => setDrawer(true)} />
+            <Eyebrow>
+              {listTitle} · {total}
+            </Eyebrow>
+          </div>
           <button
             type="button"
             onClick={() => setShowNew(true)}
@@ -352,9 +397,13 @@ export function App() {
 
       {/* Thread */}
       {selected ? (
-        <ThreadPane conversation={selected} onConversationChanged={() => load().catch(() => {})} />
+        <ThreadPane
+          conversation={selected}
+          onConversationChanged={() => load().catch(() => {})}
+          onBack={() => setSelectedId(null)}
+        />
       ) : (
-        <section className="flex min-w-0 flex-1 items-center justify-center bg-background">
+        <section className="hidden min-w-0 flex-1 items-center justify-center bg-background md:flex">
           <div className="text-center">
             <Inbox className="mx-auto size-6 text-faint" aria-hidden />
             <p className="mt-3 text-sm text-muted">Select a conversation to read the thread.</p>
@@ -374,6 +423,8 @@ export function App() {
       {showNew ? (
         <NewConversationDialog onClose={() => setShowNew(false)} onOpened={openStarted} />
       ) : null}
+
+      {sidebarDrawer}
     </div>
   );
 }

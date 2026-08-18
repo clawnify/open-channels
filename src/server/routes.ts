@@ -160,22 +160,31 @@ async function windowsFor(
   );
   if (windowed.length === 0) return out;
 
-  const lastInbound = await db
-    .select({
-      conversationId: schema.messages.conversationId,
-      at: sql<string>`max(${schema.messages.createdAt})`,
-    })
-    .from(schema.messages)
-    .where(
-      and(
-        eq(schema.messages.kind, "inbound"),
-        inArray(
-          schema.messages.conversationId,
-          windowed.map((c) => c.id),
-        ),
-      ),
-    )
-    .groupBy(schema.messages.conversationId);
+  // D1 allows at most 100 bound parameters per statement, and `kind` already
+  // takes one — a full page of 100 conversations binds 101 and the query
+  // fails. Page the id list under the cap and merge.
+  const CHUNK = 80;
+  const lastInbound: { conversationId: string; at: string }[] = [];
+  for (let i = 0; i < windowed.length; i += CHUNK) {
+    lastInbound.push(
+      ...(await db
+        .select({
+          conversationId: schema.messages.conversationId,
+          at: sql<string>`max(${schema.messages.createdAt})`,
+        })
+        .from(schema.messages)
+        .where(
+          and(
+            eq(schema.messages.kind, "inbound"),
+            inArray(
+              schema.messages.conversationId,
+              windowed.slice(i, i + CHUNK).map((c) => c.id),
+            ),
+          ),
+        )
+        .groupBy(schema.messages.conversationId)),
+    );
+  }
 
   const byConv = new Map(lastInbound.map((r) => [r.conversationId, r.at]));
   for (const c of windowed) out.set(c.id, windowFrom(byConv.get(c.id) ?? null, now));
